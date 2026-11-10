@@ -37,6 +37,29 @@ AkShare 的业绩预告、快报是按 `date=YYYYMMDD` 查询的全市场表，�
 | 港股 | Futu、Longbridge、YFinance、AkShare、Tushare | 配置 `FUTU_OPEND_HOST` 后 Futu 作为实时与基本面主源，按 `FUTU_HK_REALTIME_SOURCE_PRIORITY` 顺序尝试 | Futu 失败时回退 Longbridge / AkShare / YFinance；Longbridge 冷却或失败时继续回退 YFinance / 其他可用源 |
 | 美股 | Longbridge、YFinance、AkShare、Tushare、Finnhub、AlphaVantage、Stooq | 配置 Longbridge 凭证后参与美股日线/实时主链；YFinance 保持实时基础 fallback；Finnhub/AlphaVantage 可补充已有报价字段并参与日线链 | Longbridge 冷却或失败时实时主链回退 YFinance；两者都失败时不把补充源伪装成可独立返回报价的 fallback |
 
+## 复权口径一致性
+
+日线指标的连续性完全依赖复权基准一致。fallback 链上不同源的复权口径不同，若不统一，同一股票的历史行可能一半前复权、一半不复权，除权日跳空会直接扭曲 MA/量比，且**从价格本身无法分辨**。
+
+各数据源声明的日线复权口径（`BaseFetcher.price_adjustment`）：
+
+| 数据源 | 口径 | 说明 |
+| --- | --- | --- |
+| Efinance / AkShare / Tencent / Baostock / Longbridge / YFinance | `qfq` | 接口层即前复权 |
+| Tushare | `qfq` | A 股/ETF 拉 `adj_factor`/`fund_adj` 自算前复权并重算涨跌；港股用 `hk_daily_adj` |
+| Futu（港股） | `qfq` | 请求 `AuType.QFQ`；`max_count` 截断时告警 |
+| TickFlow | 随配置 | `TICKFLOW_KLINE_ADJUST` 为 forward/backward 时分别为 `qfq`/`hfq`，默认 `none` |
+| Pytdx / Finnhub / AlphaVantage | `none` | 原始未复权价 |
+
+落地机制：
+
+1. `DataFetcherManager` 在（重）建 fetcher 索引时，把 `name -> price_adjustment` 登记到复权口径登记表（TickFlow 等配置驱动的口径按实例登记）。
+2. 落库时写入 `stock_daily.price_adjustment`（nullable：存量行为 `NULL` = 未知，不是"不复权"）。未传显式值时按 `data_source` 自动解析，解析不到保持未知，**不会静默写成 `none`**。
+3. 写入使用 `coalesce(新值, 旧值)`：未知口径的回写不会清掉历史已记录的 `qfq`。
+4. 读取侧用 `DatabaseManager.get_price_adjustment_summary(code, start, end)` 检查窗口：出现**两种及以上已声明口径**即判定混用（`mixed=True`）；未知行不作为混用证据。回测窗口混用时会输出告警并提示清空该标的日线后重拉。
+
+存量库建议：混用告警出现时，删除该标的 `stock_daily` 行并重拉一次，即可统一为当前主链的复权基准。
+
 ## 统一数据能力只读契约
 
 Web/API 提供 `GET /api/v1/data/overview` 和等价别名 `GET /api/v1/data/capabilities`，用于把数据源能力、数据集质量和场景优先级以同一个只读结构暴露给首页看板、数据中心、个股详情、自选和选股页面。

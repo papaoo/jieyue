@@ -103,6 +103,13 @@ class StockHistoryResponse(BaseModel):
     stock_name: Optional[str] = Field(None, description="股票名称")
     period: str = Field(..., description="K 线周期")
     data: List[KLineData] = Field(default_factory=list, description="K 线数据列表")
+    source: Optional[str] = Field(None, description="实际返回历史数据的数据源；未知为 null")
+    fetched_at: Optional[str] = Field(None, description="UTC 请求完成时间，不是行情时间或最新 bar 时间")
+    status: Literal["available", "partial", "empty", "unavailable"] = Field(
+        "partial", description="获取和字段完整性状态；不代表行情新鲜度或市场正常"
+    )
+    warnings: List[str] = Field(default_factory=list, description="数据质量与解释边界警告")
+    adjustment: Optional[str] = Field(None, description="已验证的复权口径；未验证为 null")
     
     model_config = ConfigDict(json_schema_extra={
         "example": {
@@ -125,6 +132,9 @@ class StockProfileHistoryBlock(BaseModel):
     period: Literal["daily"] = "daily"
     data: List[KLineData] = Field(default_factory=list)
     limitations: List[str] = Field(default_factory=list)
+    source: Optional[str] = Field(None, description="实际历史数据源；未知为 null")
+    fetched_at: Optional[str] = Field(None, description="UTC 历史请求完成时间，不是行情时间")
+    adjustment: Optional[str] = Field(None, description="已验证的复权口径；未知为 null")
 
 
 class StockProfileResearchData(BaseModel):

@@ -34,6 +34,28 @@
     }
   ],
   "paths": {
+    "/api/v1/free-models/status": {
+      "get": {
+        "summary": "Free-channel configuration, verified catalog and recent request usage",
+        "description": "Requires enabled administrator authentication and a valid session. Does not request model inference.",
+        "responses": {"200": {"description": "Current status"}, "401": {"description": "Administrator session required"}, "403": {"description": "Administrator authentication disabled"}}
+      }
+    },
+    "/api/v1/free-models/refresh": {
+      "post": {
+        "summary": "Refresh supported zero-price model catalog",
+        "description": "Authenticated same-origin request. Checks OpenCode inventory and models.dev pricing; does not change the default model.",
+        "responses": {"200": {"description": "Verified catalog"}, "403": {"description": "Management origin/authentication rejected"}, "503": {"description": "Upstream catalog unavailable"}}
+      }
+    },
+    "/api/v1/free-models/test": {
+      "post": {
+        "summary": "Run one bounded free-model connection test",
+        "description": "Authenticated same-origin request with a public OK prompt. Does not change configuration or send notifications. A 200 response includes success=false on inference failure.",
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "additionalProperties": false, "required": ["model"], "properties": {"model": {"type": "string", "enum": ["deepseek-v4.1-flash-free", "mimo-v2.6-flash-free"]}}}}}},
+        "responses": {"200": {"description": "Test result and updated usage"}, "403": {"description": "Management origin/authentication rejected"}, "422": {"description": "Unsupported model or invalid request"}}
+      }
+    },
     "/": {
       "get": {
         "tags": [
@@ -2822,6 +2844,86 @@
           },
           "500": {
             "description": "Internal Server Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/stocks/{stock_code}/history": {
+      "get": {
+        "tags": [
+          "Stocks"
+        ],
+        "summary": "获取股票历史行情",
+        "description": "获取指定股票的历史 K 线数据",
+        "operationId": "get_stock_history_api_v1_stocks__stock_code__history_get",
+        "parameters": [
+          {
+            "name": "stock_code",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Stock Code"
+            }
+          },
+          {
+            "name": "period",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^(daily|weekly|monthly)$",
+              "description": "K 线周期",
+              "default": "daily",
+              "title": "Period"
+            },
+            "description": "K 线周期"
+          },
+          {
+            "name": "days",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 365,
+              "minimum": 1,
+              "description": "获取天数",
+              "default": 30,
+              "title": "Days"
+            },
+            "description": "获取天数"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "历史行情数据",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StockHistoryResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "不支持的周期参数",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "服务器错误",
             "content": {
               "application/json": {
                 "schema": {
@@ -8663,6 +8765,42 @@
             },
             "type": "array",
             "title": "Limitations"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source",
+            "description": "实际历史数据源；未知为 null"
+          },
+          "fetched_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fetched At",
+            "description": "UTC 历史请求完成时间，不是行情时间"
+          },
+          "adjustment": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Adjustment",
+            "description": "已验证的复权口径；未知为 null"
           }
         },
         "type": "object",
@@ -8670,6 +8808,109 @@
           "status"
         ],
         "title": "StockProfileHistoryBlock"
+      },
+      "StockHistoryResponse": {
+        "properties": {
+          "stock_code": {
+            "type": "string",
+            "title": "Stock Code",
+            "description": "股票代码"
+          },
+          "stock_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stock Name",
+            "description": "股票名称"
+          },
+          "period": {
+            "type": "string",
+            "title": "Period",
+            "description": "K 线周期"
+          },
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/KLineData"
+            },
+            "type": "array",
+            "title": "Data",
+            "description": "K 线数据列表"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source",
+            "description": "实际返回历史数据的数据源；未知为 null"
+          },
+          "fetched_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fetched At",
+            "description": "UTC 请求完成时间，不是行情时间或最新 bar 时间"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "available",
+              "partial",
+              "empty",
+              "unavailable"
+            ],
+            "title": "Status",
+            "description": "获取和字段完整性状态；不代表行情新鲜度或市场正常",
+            "default": "partial"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Warnings",
+            "description": "数据质量与解释边界警告"
+          },
+          "adjustment": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Adjustment",
+            "description": "已验证的复权口径；未验证为 null"
+          }
+        },
+        "type": "object",
+        "required": [
+          "stock_code",
+          "period"
+        ],
+        "title": "StockHistoryResponse",
+        "description": "股票历史行情响应",
+        "example": {
+          "data": [],
+          "period": "daily",
+          "stock_code": "600519",
+          "stock_name": "贵州茅台"
+        }
       },
       "KLineData": {
         "properties": {

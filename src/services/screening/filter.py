@@ -8,11 +8,15 @@ import math
 from dataclasses import fields, replace
 
 import pandas as pd
+import numpy as np
 
 from src.services.screening.models import HardFilterConfig
 
 logger = logging.getLogger(__name__)
 _DAILY_FILTER_DEFAULTS = {
+    "require_volume_contraction": False,
+    "require_pullback_convergence": False,
+    "require_breakout_confirmation": False,
     "change_60d_min": None,
     "change_60d_max": None,
     "require_ma_bullish": False,
@@ -79,6 +83,9 @@ def apply_hard_filters(df: pd.DataFrame, filters: HardFilterConfig) -> pd.DataFr
     mask = _filter_max(result, mask, ["change_60d"], filters.change_60d_max)
     mask = _filter_bool_true(result, mask, "ma_bullish", filters.require_ma_bullish)
     mask = _filter_bool_true(result, mask, "price_above_ma20", filters.require_price_above_ma20)
+    mask = _filter_bool_true(result, mask, "volume_contracting", filters.require_volume_contraction)
+    mask = _filter_bool_true(result, mask, "pullback_converging", filters.require_pullback_convergence)
+    mask = _filter_bool_true(result, mask, "breakout_confirmed", filters.require_breakout_confirmation)
     mask = _filter_min(result, mask, ["signal_score"], filters.signal_score_min)
     mask = _filter_in(result, mask, "macd_status", filters.macd_status_whitelist)
     mask = _filter_in(result, mask, "rsi_status", filters.rsi_status_whitelist)
@@ -133,6 +140,9 @@ def check_hard_filters(snapshot: dict[str, object], filters: HardFilterConfig) -
     checks: list[dict[str, object]] = []
     disabled = HardFilterConfig(exclude_st=False)
     aliases = {
+        "volume_contraction": ["volume_contracting"],
+        "pullback_convergence": ["pullback_converging"],
+        "breakout_confirmation": ["breakout_confirmed"],
         "exclude_st": ["name", "股票名称", "名称"],
         "amount": ["amount", "成交额"],
         "price": ["price", "最新价", "现价"],
@@ -171,6 +181,9 @@ def check_hard_filters(snapshot: dict[str, object], filters: HardFilterConfig) -
                 current = current.item() if hasattr(current, "item") else current
         if name == "exclude_st" and reason is None and not isinstance(current, str):
             reason = "invalid_text"
+        if (name in {"require_volume_contraction", "require_pullback_convergence", "require_breakout_confirmation"}
+                and reason is None and not isinstance(current, bool)):
+            reason = "invalid_boolean"
         missing = reason is not None
         passed = None
         if not missing:
@@ -247,6 +260,11 @@ def hard_filter_rejection_summary(
         record("require_ma_bullish", _filter_bool_true(df, mask, "ma_bullish", True))
     if filters.require_price_above_ma20:
         record("require_price_above_ma20", _filter_bool_true(df, mask, "price_above_ma20", True))
+    for flag, column in (("require_volume_contraction", "volume_contracting"),
+                         ("require_pullback_convergence", "pullback_converging"),
+                         ("require_breakout_confirmation", "breakout_confirmed")):
+        if getattr(filters, flag):
+            record(flag, _filter_bool_true(df, mask, column, True))
 
     record_min("signal_score_min", ["signal_score"], filters.signal_score_min)
     if filters.macd_status_whitelist:
@@ -347,6 +365,11 @@ def hard_filter_waterfall(
         record("require_ma_bullish", _filter_bool_true(df, mask, "ma_bullish", True), ["ma_bullish"])
     if filters.require_price_above_ma20:
         record("require_price_above_ma20", _filter_bool_true(df, mask, "price_above_ma20", True), ["price_above_ma20"])
+    for flag, column in (("require_volume_contraction", "volume_contracting"),
+                         ("require_pullback_convergence", "pullback_converging"),
+                         ("require_breakout_confirmation", "breakout_confirmed")):
+        if getattr(filters, flag):
+            record(flag, _filter_bool_true(df, mask, column, True), [column])
 
     record_min("signal_score_min", ["signal_score"], filters.signal_score_min)
     if filters.macd_status_whitelist:
@@ -377,6 +400,9 @@ def hard_filter_waterfall(
 def requires_daily_features(filters: HardFilterConfig) -> bool:
     """Return whether a hard-filter config needs daily K-line features."""
     return any([
+        filters.require_volume_contraction,
+        filters.require_pullback_convergence,
+        filters.require_breakout_confirmation,
         filters.change_60d_min is not None,
         filters.change_60d_max is not None,
         filters.require_ma_bullish,
@@ -470,6 +496,8 @@ def _filter_bool_true(
         raise SnapshotFieldMissingError(
             f"Missing required daily feature column for bool filter: {col_name}"
         )
+    if col_name in {"volume_contracting", "pullback_converging", "breakout_confirmed"}:
+        return mask & df[col_name].map(lambda value: isinstance(value, (bool, np.bool_)) and bool(value))
     return mask & (df[col_name] == True)  # noqa: E712
 
 

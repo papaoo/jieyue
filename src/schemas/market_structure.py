@@ -39,6 +39,13 @@ class RankedThemeItem(BaseModel):
     source: ThemeRankSource = "unknown"
     code: Optional[str] = None
     updated_at: Optional[str] = None
+    as_of: Optional[str] = None
+    provider: Optional[str] = None
+    definition: Optional[str] = None
+    definition_warning: Optional[str] = None
+    coverage_complete: Optional[bool] = None
+    coverage_ratio: Optional[float] = None
+    membership_is_point_in_time: Optional[bool] = None
 
 
 class MarketThemeItem(RankedThemeItem):
@@ -84,6 +91,8 @@ class PrimaryTheme(BaseModel):
     phase: ThemePhase = "unknown"
     rank: Optional[int] = None
     change_pct: Optional[float] = None
+    as_of: Optional[str] = None
+    provider: Optional[str] = None
 
 
 class MarketStructureRiskTag(BaseModel):

@@ -540,11 +540,16 @@ class StockAnalysisPipeline:
             # Step 2: 获取筹码分布 - 使用统一入口，带熔断保护
             # 指数目标跳过筹码分布（INDEX_SKIP_MODULES 能力矩阵）
             chip_data = None
+            chip_evidence = None
             if is_index and "chip_distribution" in INDEX_SKIP_MODULES:
                 logger.debug(f"{stock_name}({code}) 指数目标跳过筹码分布")
             else:
                 try:
-                    chip_data = self.fetcher_manager.get_chip_distribution(code)
+                    chip_result = self.fetcher_manager.get_chip_distribution(code, with_metadata=True)
+                    if isinstance(chip_result, tuple) and len(chip_result) == 2:
+                        chip_data, chip_evidence = chip_result
+                    else:
+                        chip_data = chip_result  # Legacy injected managers.
                     if chip_data:
                         logger.info(f"{stock_name}({code}) 筹码分布: 获利比例={chip_data.profit_ratio:.1%}, "
                                   f"90%集中度={chip_data.concentration_90:.2%}")
@@ -676,6 +681,7 @@ class StockAnalysisPipeline:
                     portfolio_context=portfolio_context,
                     market_structure_context=market_structure_context,
                     analysis_target=analysis_target,
+                    chip_evidence=chip_evidence,
                 )
 
             # Step 4: 多维度情报搜索（最新消息+风险排查+业绩预期）
@@ -897,7 +903,7 @@ class StockAnalysisPipeline:
 
             # Step 7.6: chip_structure fallback (Issue #589) and unavailable collapse
             if result:
-                normalize_chip_structure_availability(result, chip_data)
+                normalize_chip_structure_availability(result, chip_data, chip_evidence)
 
             # Step 7.7: price_position fallback
             if result:
@@ -999,6 +1005,24 @@ class StockAnalysisPipeline:
             logger.exception(f"{stock_name}({code}) 详细错误信息:")
             return None
     
+    @staticmethod
+    def _verified_quote_date(realtime_quote: Any, market_now: datetime) -> Optional[date]:
+        """Only a dated, non-stale current-session quote can amend daily evidence."""
+        if realtime_quote is None or getattr(realtime_quote, 'is_stale', False):
+            return None
+        timestamp = getattr(realtime_quote, 'provider_timestamp', None)
+        if not timestamp:
+            return None
+        try:
+            quote_time = pd.Timestamp(timestamp)
+            if pd.isna(quote_time):
+                return None
+            if quote_time.tzinfo is not None and market_now.tzinfo is not None:
+                quote_time = quote_time.tz_convert(market_now.tzinfo)
+            return quote_time.date() if quote_time.date() == market_now.date() else None
+        except (ValueError, TypeError, OverflowError):
+            return None
+
     def _enhance_context(
         self,
         context: Dict[str, Any],
@@ -1051,6 +1075,7 @@ class StockAnalysisPipeline:
                 'name': getattr(realtime_quote, 'name', ''),
                 'price': getattr(realtime_quote, 'price', None),
                 'change_pct': getattr(realtime_quote, 'change_pct', None),
+                'pre_close': getattr(realtime_quote, 'pre_close', None),
                 'volume_ratio': volume_ratio,
                 'volume_ratio_desc': self._describe_volume_ratio(volume_ratio) if volume_ratio else '无数据',
                 'turnover_rate': getattr(realtime_quote, 'turnover_rate', None),
@@ -1073,6 +1098,9 @@ class StockAnalysisPipeline:
         if chip_data:
             current_price = getattr(realtime_quote, 'price', 0) if realtime_quote else 0
             enhanced['chip'] = {
+                'date': chip_data.date,
+                'source': chip_data.source,
+                'method': 'estimated_cost_distribution_not_actual_positions_or_future_win_rate',
                 'profit_ratio': chip_data.profit_ratio,
                 'avg_cost': chip_data.avg_cost,
                 'concentration_90': chip_data.concentration_90,
@@ -1098,16 +1126,25 @@ class StockAnalysisPipeline:
 
         # Issue #234：盘中分析使用实时 OHLC 与趋势 MA 覆盖 today。
         # 防护条件：trend_result.ma5 > 0 表示 MA 计算已成功且数据量充足。
-        if realtime_quote and trend_result and trend_result.ma5 > 0:
+        quote_day = self._verified_quote_date(realtime_quote, get_market_now(
+            get_market_for_stock(normalize_stock_code(enhanced.get('code', '')))))
+        original_day = str((enhanced.get('today') or {}).get('date') or enhanced.get('date') or '')[:10]
+        if enhanced.get('realtime') is not None:
+            enhanced['realtime']['technical_use'] = 'eligible' if quote_day else 'excluded_unverified_or_stale_date'
+        if (realtime_quote and trend_result and trend_result.ma5 > 0 and quote_day
+                and (not original_day or original_day <= quote_day.isoformat())):
             price = getattr(realtime_quote, 'price', None)
             if price is not None and price > 0:
-                yesterday_close = None
-                if enhanced.get('yesterday') and isinstance(enhanced['yesterday'], dict):
-                    yesterday_close = enhanced['yesterday'].get('close')
                 orig_today = enhanced.get('today') or {}
-                market_today = get_market_now(
-                    get_market_for_stock(normalize_stock_code(enhanced.get('code', '')))
-                ).date().isoformat()
+                market_today = quote_day.isoformat()
+                # The stored 'today' is often the last *completed* session.
+                # Roll it forward before comparisons, rather than retaining D-2.
+                original_day = str(orig_today.get('date') or enhanced.get('date') or '')[:10]
+                if original_day and original_day < market_today:
+                    enhanced['yesterday'] = dict(orig_today)
+                yesterday_close = (enhanced.get('yesterday') or {}).get('close')
+                quote_pre_close = getattr(realtime_quote, 'pre_close', None)
+                comparison_close = quote_pre_close if quote_pre_close is not None else yesterday_close
                 source = getattr(realtime_quote, 'source', None)
                 source_name = getattr(source, 'value', source)
                 source_name = str(source_name) if source_name is not None else 'unknown'
@@ -1134,6 +1171,10 @@ class StockAnalysisPipeline:
                     'data_source': f"realtime:{source_name}",
                     'realtime_source': source_name,
                     'is_estimated': True,
+                    'pre_close': comparison_close,
+                    'date_basis': 'provider_timestamp',
+                    'is_partial_bar': True,
+                    'volume_unit': 'shares',
                 }
                 estimated_fields = [
                     'close', 'open', 'high', 'low', 'ma5', 'ma10', 'ma20',
@@ -1158,6 +1199,7 @@ class StockAnalysisPipeline:
                     realtime_today['fallback_from'] = fallback_from
                 realtime_owned_fields = {
                     'open', 'high', 'low', 'close',
+                    'pre_close', 'prev_close', 'volume_unit',
                     'volume', 'amount', 'pct_chg', 'pctChg',
                     'date', 'data_source', 'dataSource', 'source',
                     'realtime_source', 'realtimeSource',
@@ -1174,13 +1216,16 @@ class StockAnalysisPipeline:
                     price, trend_result.ma5, trend_result.ma10, trend_result.ma20
                 )
                 enhanced['date'] = market_today
-                if yesterday_close is not None:
+                enhanced.pop('price_change_ratio', None)
+                enhanced.pop('volume_change_ratio', None)
+                if comparison_close is not None:
                     try:
-                        yc = float(yesterday_close)
+                        yc = float(comparison_close)
                         if yc > 0:
                             enhanced['price_change_ratio'] = round(
                                 (price - yc) / yc * 100, 2
                             )
+                            realtime_today['pct_chg'] = enhanced['price_change_ratio']
                     except (TypeError, ValueError):
                         pass
                 if vol is not None and enhanced.get('yesterday'):
@@ -1196,6 +1241,11 @@ class StockAnalysisPipeline:
                                 )
                         except (TypeError, ValueError):
                             pass
+                enhanced['volume_comparison_basis'] = (
+                    'intraday_vs_previous_full_session'
+                    if realtime_today.get('is_partial_bar') is not False
+                    else 'full_session_vs_previous_full_session'
+                )
 
         # ETF/index flag for analyzer prompt (Fixes #274)
         enhanced['is_index_etf'] = SearchService.is_index_or_etf(
@@ -1474,6 +1524,7 @@ class StockAnalysisPipeline:
         portfolio_context: Optional[Dict[str, Any]] = None,
         market_structure_context: Optional[Dict[str, Any]] = None,
         analysis_target: Optional[AnalysisTarget] = None,
+        chip_evidence: Optional[Dict[str, Any]] = None,
     ) -> Optional[AnalysisResult]:
         """
         使用 Agent 模式分析单只股票。
@@ -1683,8 +1734,8 @@ class StockAnalysisPipeline:
                         missing,
                     )
             # chip_structure fallback (Issue #589), before save_analysis_history
-            if result and chip_data is not None:
-                normalize_chip_structure_availability(result, chip_data)
+            if result and (chip_data is not None or chip_evidence is not None):
+                normalize_chip_structure_availability(result, chip_data, chip_evidence)
 
             # price_position fallback (same as non-agent path Step 7.7)
             if result:
@@ -2757,7 +2808,10 @@ class StockAnalysisPipeline:
             return df
         if market is None:
             market = get_market_for_stock(code)
-        market_today = get_market_now(market).date()
+        market_now = get_market_now(market)
+        market_today = market_now.date()
+        if self._verified_quote_date(realtime_quote, market_now) is None:
+            return df
         if market and not is_market_open(market, market_today):
             return df
 
@@ -2766,6 +2820,8 @@ class StockAnalysisPipeline:
             last_val.date() if hasattr(last_val, 'date') else
             (last_val if isinstance(last_val, date) else pd.Timestamp(last_val).date())
         )
+        if last_date > market_today:
+            return df  # Never overwrite a newer bar with older quote evidence.
         yesterday_close = float(df.iloc[-1]['close']) if len(df) > 0 else price
         open_p = getattr(realtime_quote, 'open_price', None) or getattr(
             realtime_quote, 'pre_close', None

@@ -16,6 +16,7 @@ from warnings import warn
 import anyio.to_thread
 import fastapi.testclient
 import httpx
+import pytest
 import starlette.testclient
 from anyio._backends import _asyncio
 
@@ -249,3 +250,18 @@ class _ThreadlessTestClient:
 
 fastapi.testclient.TestClient = _ThreadlessTestClient
 starlette.testclient.TestClient = _ThreadlessTestClient
+
+
+@pytest.fixture(autouse=True)
+def _reset_notification_noise_state():
+    """Reset process-local notification dedup/cooldown state around every test.
+
+    The noise-control state is intentionally process-local; without this reset,
+    tests that push identical content in the same process would suppress each
+    other once dedup defaults are enabled.
+    """
+    from src.notification_noise import reset_notification_noise_state
+
+    reset_notification_noise_state()
+    yield
+    reset_notification_noise_state()

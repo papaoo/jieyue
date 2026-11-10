@@ -564,12 +564,14 @@ class PortfolioServiceTestCase(unittest.TestCase):
 
         self.assertEqual(snapshot["account_count"], 2)
         self.assertEqual(snapshot["data_quality"], "partial")
+        self.assertFalse(snapshot["valuation_complete"])
         self.assertEqual(
             snapshot["limitations"],
             [
                 "realtime_quote_best_effort",
                 "fx_and_cost_basis_partial",
                 "sector_and_risk_metrics_limited",
+                "missing_fx",
             ],
         )
 

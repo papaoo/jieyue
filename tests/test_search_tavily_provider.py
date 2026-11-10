@@ -135,7 +135,7 @@ class TestTavilySearchProvider(unittest.TestCase):
                             {
                                 "title": f"Fresh article via {field_name}",
                                 "url": "https://example.com/fresh-article",
-                                "content": "Fresh coverage",
+                                "content": "BABA 阿里巴巴 quarterly earnings coverage",
                                 field_name: published_text,
                             }
                         ]
@@ -160,6 +160,7 @@ class TestTavilySearchProvider(unittest.TestCase):
                 "results": [
                     {
                         "title": "Alibaba quarterly results",
+                        "published_date": datetime.now(timezone.utc).isoformat(),
                         "url": "https://example.com/alibaba-event",
                         "content": "Event coverage",
                     }

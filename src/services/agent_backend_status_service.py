@@ -339,4 +339,6 @@ class AgentBackendStatusService:
             field_name="AGENT_ORCHESTRATOR_TIMEOUT_S",
             minimum=0,
         )
+        from src.llm.free_models import apply_runtime_route
+        apply_runtime_route(config)
         return config

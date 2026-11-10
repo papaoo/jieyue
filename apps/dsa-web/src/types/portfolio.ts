@@ -46,6 +46,7 @@ export interface PortfolioPositionItem {
   priceDate?: string | null;
   priceStale?: boolean;
   priceAvailable?: boolean;
+  valuationComplete?: boolean;
   dataQuality?: 'ok' | 'partial' | string;
   limitations?: string[];
 }
@@ -75,6 +76,7 @@ export interface PortfolioAccountSnapshot {
   feeTotal: number;
   taxTotal: number;
   fxStale: boolean;
+  valuationComplete?: boolean;
   dataQuality?: 'ok' | 'partial' | string;
   limitations?: string[];
   positions: PortfolioPositionItem[];
@@ -93,6 +95,7 @@ export interface PortfolioSnapshotResponse {
   feeTotal: number;
   taxTotal: number;
   fxStale: boolean;
+  valuationComplete?: boolean;
   dataQuality?: 'ok' | 'partial' | string;
   limitations?: string[];
   accounts: PortfolioAccountSnapshot[];
@@ -114,9 +117,11 @@ export interface PortfolioSectorConcentrationItem {
 }
 
 export interface PortfolioDrawdownBlock {
+  available?: boolean;
+  reason?: string;
   seriesPoints: number;
-  maxDrawdownPct: number;
-  currentDrawdownPct: number;
+  maxDrawdownPct: number | null;
+  currentDrawdownPct: number | null;
   alert: boolean;
   fxStale: boolean;
 }
@@ -157,14 +162,18 @@ export interface PortfolioRiskResponse {
   currency: string;
   thresholds: Record<string, number>;
   concentration: {
-    totalMarketValue: number;
-    topWeightPct: number;
+    available?: boolean;
+    reason?: string;
+    totalMarketValue: number | null;
+    topWeightPct: number | null;
     alert: boolean;
     topPositions: PortfolioConcentrationItem[];
   };
   sectorConcentration: {
-    totalMarketValue: number;
-    topWeightPct: number;
+    available?: boolean;
+    reason?: string;
+    totalMarketValue: number | null;
+    topWeightPct: number | null;
     alert: boolean;
     topSectors: PortfolioSectorConcentrationItem[];
     coverage: Record<string, number>;
@@ -172,6 +181,8 @@ export interface PortfolioRiskResponse {
   };
   drawdown: PortfolioDrawdownBlock;
   stopLoss: {
+    available?: boolean;
+    reason?: string;
     nearAlert: boolean;
     triggeredCount: number;
     nearCount: number;

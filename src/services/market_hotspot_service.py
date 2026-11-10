@@ -144,6 +144,10 @@ class MarketHotspotService:
             list(leading_industries) + list(leading_concepts),
             limit=limit,
         )
+        ranked_items = leading_industries + leading_concepts + lagging_themes
+        observed_dates = {item.as_of for item in ranked_items}
+        # A requested/generated date is not evidence of the ranking's business date.
+        observed_trade_date = next(iter(observed_dates)) if len(observed_dates) == 1 else None
 
         missing_fields: List[str] = []
         if not leading_industries and not bottom_industries:
@@ -167,7 +171,7 @@ class MarketHotspotService:
         context = MarketThemeContext(
             status=status,
             market=normalized_market,
-            trade_date=trade_date_text,
+            trade_date=observed_trade_date,
             active_themes=active_themes,
             leading_industries=leading_industries,
             leading_concepts=leading_concepts,
@@ -601,6 +605,13 @@ class MarketHotspotService:
                     rank=self._safe_int(item.get("rank")) or index,
                     source=source,
                     updated_at=self._optional_text(item.get("updated_at")),
+                    as_of=self._format_trade_date(item.get('as_of') or item.get('trade_date')),
+                    provider=self._optional_text(item.get('provider') or item.get('source')),
+                    definition=self._optional_text(item.get('definition')),
+                    definition_warning=self._optional_text(item.get('definition_warning')),
+                    coverage_complete=item.get('coverage_complete'),
+                    coverage_ratio=self._safe_float(item.get('coverage_ratio')),
+                    membership_is_point_in_time=item.get('membership_is_point_in_time'),
                 )
             )
         return normalized
@@ -620,15 +631,10 @@ class MarketHotspotService:
         for item in positive_items[:limit]:
             active.append(
                 MarketThemeItem(
-                    name=item.name,
-                    code=item.code,
-                    change_pct=item.change_pct,
-                    rank=item.rank,
-                    source=item.source,
-                    updated_at=item.updated_at,
-                    phase=self._phase_from_change(item.change_pct),
+                    **item.model_dump(),
+                    phase="unknown",
                     strength_score=self._strength_from_change(item.change_pct),
-                    reason="industry/concept ranking gain",
+                    reason="positive return in dated ranking only; no time-series evidence of acceleration or persistence",
                 )
             )
         return active

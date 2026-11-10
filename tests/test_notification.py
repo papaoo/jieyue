@@ -379,7 +379,7 @@ class TestNotificationServiceSendToMethods(unittest.TestCase):
         reply_client.send_to_chat.assert_not_called()
 
     @mock.patch("src.notification.get_config")
-    def test_feishu_context_failure_does_not_fallback_to_static_webhook(self, mock_get_config: mock.MagicMock):
+    def test_feishu_context_failure_falls_back_to_static_webhook(self, mock_get_config: mock.MagicMock):
         cfg = _make_config(
             feishu_webhook_url="https://open.feishu.cn/open-apis/bot/v2/hook/test-token",
             feishu_app_id="cli_test",
@@ -392,11 +392,12 @@ class TestNotificationServiceSendToMethods(unittest.TestCase):
              mock.patch.object(service, "send_to_feishu", return_value=True) as mock_webhook:
             result = service.send_with_results("content", route_type="report")
 
+        # 上下文会话推送失败时，必须降级到静态渠道，而不是整体丢弃
         self.assertTrue(result.dispatched)
-        self.assertFalse(result.success)
-        self.assertEqual(result.status, "all_failed")
-        self.assertEqual([item.channel for item in result.channel_results], ["__context__"])
-        mock_webhook.assert_not_called()
+        self.assertTrue(result.success)
+        self.assertEqual(result.status, "sent")
+        self.assertIn("__context__", [item.channel for item in result.channel_results])
+        mock_webhook.assert_called_once()
 
     @mock.patch("src.notification.get_config")
     def test_dingtalk_context_response_skips_static_webhook(self, mock_get_config: mock.MagicMock):
@@ -798,6 +799,45 @@ class TestNotificationServiceReportGeneration(unittest.TestCase):
         self.assertIn("🟢 Add Corp(ADD): Add | Score 50", summary)
         self.assertNotIn("Buy | Score 50", summary)
         self.assertNotIn("Strong Buy", summary)
+
+    @mock.patch("src.notification.get_config")
+    def test_build_signal_alert_has_fixed_fields_and_disclaimer(self, mock_get_config: mock.MagicMock):
+        mock_get_config.return_value = _make_config()
+
+        text = NotificationBuilder.build_signal_alert(
+            title="贵州茅台",
+            reason="价格跌破 MA20 支撑",
+            target="贵州茅台(600519)",
+            observed_value=1680.5,
+            threshold=1700.0,
+            data_timestamp="2026-10-16T14:30:00+08:00",
+            data_source="efinance",
+            ai_summary="技术面走弱，注意仓位",
+        )
+
+        self.assertIn("预警触发｜贵州茅台(600519)", text)
+        self.assertIn("**当前值** 1680.5", text)
+        self.assertIn("**触发条件** 1700", text)
+        self.assertIn("**数据时间** 2026-10-16T14:30:00+08:00", text)
+        self.assertIn("**规则**：价格跌破 MA20 支撑", text)
+        self.assertIn("🧠 **AI 简评**：技术面走弱，注意仓位", text)
+        # 新手提示 + 免责声明必须存在
+        self.assertIn("不代表一定涨跌", text)
+        self.assertIn("仅供参考，不构成投资建议", text)
+        self.assertNotIn("⚠️ ⚠️", text)
+
+    @mock.patch("src.notification.get_config")
+    def test_build_signal_alert_disclaimer_can_be_disabled(self, mock_get_config: mock.MagicMock):
+        mock_get_config.return_value = _make_config(report_disclaimer_enabled=False)
+
+        text = NotificationBuilder.build_signal_alert(
+            title="AAPL",
+            reason="RSI below 30",
+            report_language="en",
+        )
+
+        self.assertNotIn("Not investment advice", text)
+        self.assertIn("Alert triggered", text)
 
     @mock.patch("src.notification.get_config")
     def test_report_rows_and_summary_use_same_score_aligned_action(
@@ -1741,14 +1781,16 @@ class TestNotificationServiceReportGeneration(unittest.TestCase):
         self.assertIn("30.8760 元", out)
         self.assertIn("1.85%", out)
         self.assertIn("2024-06-26", out)
-        # 关联板块（白酒带行业信号；MSCI中国 带概念信号）
+        # Unknown-date/provider concept snapshots are background, not live signals.
         self.assertIn("关联板块", out)
         self.assertIn("白酒", out)
         self.assertIn("领涨", out)
         self.assertIn("+3.42%", out)
         self.assertIn("MSCI中国", out)
         self.assertIn("- 白酒 (行业板块 领涨 +3.42%)", out)
-        self.assertIn("- MSCI中国 (概念板块 领涨 +1.23%)", out)
+        self.assertIn("- MSCI中国", out)
+        self.assertIn("同名概念快照，仅作背景", out)
+        self.assertNotIn("MSCI中国 (概念板块 领涨", out)
         self.assertIn("+1.23%", out)
         self.assertNotIn("| 板块 | 类型 | 板块表现 | 板块涨跌幅 |", out)
 
@@ -1781,7 +1823,9 @@ class TestNotificationServiceReportGeneration(unittest.TestCase):
         out = service.generate_single_stock_report(result)
 
         self.assertIn("关联板块", out)
-        self.assertIn("- 白酒 (概念板块 领跌 -3.20%)", out)
+        self.assertIn("白酒: -3.20%", out)
+        self.assertIn("同名概念快照，仅作背景", out)
+        self.assertNotIn("概念板块 领跌", out)
         self.assertNotIn("| 白酒 | 概念 |", out)
         self.assertNotIn("+2.31%", out)
 

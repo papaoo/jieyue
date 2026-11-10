@@ -5,27 +5,29 @@
 
 import copy
 import logging
+import math
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+import numpy as np
 import pandas as pd
 
 from src.services.screening.config import Config
 from src.services.screening.candidate_context import collect_candidate_context
 from src.services.screening.context import build_llm_context
-from src.services.screening.daily import enrich_daily_features
+from src.services.screening.daily import _DAILY_FEATURE_DEFAULTS, STRICT_HISTORY_DAYS, enrich_daily_features
+from src.services.screening.requirements import required_daily_fields, requires_daily_evidence
 from src.services.screening.dsa_provider import apply_dsa_provider_context
 from src.services.screening.filter import (
     apply_hard_filters,
     hard_filter_rejection_summary,
     hard_filter_waterfall,
-    requires_daily_features,
     without_daily_filters,
 )
 from src.services.screening.industry import enrich_industry_concepts
-from src.services.screening.models import Pick, ScreenResult
+from src.services.screening.models import Pick, ScreenResult, ScreeningConfig
 from src.services.screening.normalize import (
     normalize_code,
     safe_bool as _safe_bool,
@@ -74,6 +76,12 @@ def screen(
     config: Config | None = None,
     progress_callback: Callable[[int, str], None] | None = None,
     daily_history_fetcher: Callable[..., pd.DataFrame] | None = None,
+    frozen_snapshot: pd.DataFrame | None = None,
+    frozen_daily_features: pd.DataFrame | None = None,
+    compute_only: bool = False,
+    reference_dataset=None,
+    closed_session: date | None = None,
+    reference_refresh: Callable | None = None,
 ) -> ScreenResult:
     """Execute stock screening with the given strategy.
 
@@ -105,10 +113,21 @@ def screen(
         config: Runtime config. Defaults to Config.from_env().
         daily_history_fetcher: Optional request-scoped daily-history provider.
             It is tried in place of the bundled fetcher without global patching.
+        frozen_snapshot: Already normalized request-local input, defensively copied.
+        frozen_daily_features: Precomputed daily features keyed by canonical code.
+        compute_only: Require explicit frozen inputs/config; prohibit external work.
 
     Returns:
         ScreenResult with ranked picks.
     """
+    if compute_only:
+        if config is None or frozen_snapshot is None:
+            raise ValueError("compute_only requires explicit config and frozen_snapshot")
+        config = copy.deepcopy(config)
+        use_llm = False
+        deep_analysis = False
+        context = None
+        selection_seed = ""
     if config is None:
         config = Config.from_env()
 
@@ -126,6 +145,12 @@ def screen(
 
     strat = strategies[strategy]
     screening = strat.screening
+    if screening.evidence_mode == 'daily_required' and frozen_snapshot is None and not compute_only:
+        # Strict built-ins are end-of-day rules. Realtime snapshot providers
+        # remain available for quote display and legacy custom strategies.
+        from src.services.screening.backtest_data import screen_closed_session
+        return screen_closed_session(strategy, config, dataset=reference_dataset,
+                                     signal_date=closed_session, max_output=max_output, refresh=reference_refresh)
     if market not in screening.market_scope:
         raise ValueError(
             f"Strategy '{strategy}' does not support market '{market}'. "
@@ -135,20 +160,27 @@ def screen(
     analyzer_names = normalize_post_analyzers(
         post_analyzers if post_analyzers is not None else config.post_analyzers
     )
+    if compute_only:
+        analyzer_names = [name for name in analyzer_names if name == "scorecard"]
     if deep_analysis and "dsa" not in analyzer_names:
         analyzer_names.append("dsa")
     analyzer_max_picks = (
         post_analysis_max_picks
         or deep_analysis_max_picks
     )
-    daily_needed = requires_daily_features(screening.hard_filters)
+    daily_needed = requires_daily_evidence(screening)
     daily_requested = config.daily_enrich_enabled if daily_enrich is None else daily_enrich
-    daily_limit = daily_enrich_max_candidates or config.daily_enrich_max_candidates
+    daily_limit = (config.daily_enrich_max_candidates if daily_enrich_max_candidates is None
+                   else daily_enrich_max_candidates)
+    if (compute_only or frozen_daily_features is not None) and (
+        isinstance(daily_limit, bool) or not isinstance(daily_limit, int) or daily_limit < 1
+    ):
+        raise ValueError("frozen daily candidate limit must be a positive integer")
     snapshot_filters = without_daily_filters(screening.hard_filters) if daily_needed else screening.hard_filters
 
     # 2. Fetch snapshot
     _emit_progress(progress_callback, 25, "正在读取全市场快照")
-    snapshot_df = fetch_snapshot_with_fallback(
+    snapshot_df = _copy_frozen_frame(frozen_snapshot) if frozen_snapshot is not None else fetch_snapshot_with_fallback(
         config.snapshot_source_priority,
         required_columns=_required_snapshot_columns(snapshot_filters),
         fallback_snapshot_path=config.fallback_snapshot_path,
@@ -156,6 +188,11 @@ def screen(
         cache_ttl_seconds=config.snapshot_cache_ttl_seconds,
         market=market,
     )
+    if screening.evidence_mode == 'daily_required':
+        from src.services.screening.industry_reference import industry_identity
+        if any(not industry_identity(row, snapshot_df.attrs.get('signal_date')).startswith('capco_major_v1:')
+               for _, row in snapshot_df.iterrows()):
+            raise ValueError('required_published_capco_reference_missing')
     effective_industry_map_files = (
         list(industry_map_files)
         if industry_map_files is not None
@@ -167,7 +204,7 @@ def screen(
         else config.industry_provider
     )
     effective_industry_provider = str(effective_industry_provider or "none").strip().lower()
-    if effective_industry_map_files or effective_industry_provider not in {"", "none", "off", "false"}:
+    if not compute_only and (effective_industry_map_files or effective_industry_provider not in {"", "none", "off", "false"}):
         snapshot_df, industry_notes = enrich_industry_concepts(
             snapshot_df,
             map_files=effective_industry_map_files,
@@ -180,6 +217,7 @@ def screen(
     snapshot_count = len(snapshot_df)
     snapshot_source = str(snapshot_df.attrs.get("snapshot_source", ""))
     source_errors = [str(item) for item in snapshot_df.attrs.get("source_errors", [])]
+    degradation.extend(str(item) for item in snapshot_df.attrs.get("data_warnings", []))
     degradation.extend(f"Snapshot source fallback: {item}" for item in source_errors)
     if bool(snapshot_df.attrs.get("fallback_used")):
         stale_age = snapshot_df.attrs.get("stale_age_hours")
@@ -229,24 +267,41 @@ def screen(
     daily_enriched = False
     daily_enrich_count = 0
     if daily_needed or daily_requested:
-        provisional = _sort_screened_candidates(compute_screen_scores(df, screening), screening)
-        enrich_count = min(daily_limit, len(provisional))
+        provisional = _provisional_candidates(df, screening)
+        strict_evidence = screening.evidence_mode == "daily_required"
+        if strict_evidence and frozen_daily_features is None and not compute_only and daily_limit < len(provisional):
+            raise RuntimeError("Incomplete daily evidence: candidate budget excludes required candidates")
+        enrich_count = (len(provisional) if strict_evidence and (compute_only or frozen_daily_features is not None)
+                        else min(daily_limit, len(provisional)))
         daily_candidates = provisional.head(enrich_count)
         try:
-            enriched = enrich_daily_features(
-                daily_candidates,
-                max_rows=enrich_count,
-                lookback_days=config.daily_lookback_days,
-                source=config.daily_source,
-                fetch_retries=config.daily_fetch_retries,
-                cache_dir=config.daily_history_cache_dir,
-                cache_ttl_seconds=config.daily_history_cache_ttl_hours * 3600,
-                max_workers=config.daily_fetch_max_workers,
-                history_fetcher=daily_history_fetcher,
-            )
+            if compute_only or frozen_daily_features is not None:
+                enriched = _merge_frozen_daily_features(daily_candidates, frozen_daily_features, screening=screening)
+            else:
+                enriched = enrich_daily_features(
+                    daily_candidates,
+                    max_rows=enrich_count,
+                    lookback_days=STRICT_HISTORY_DAYS if strict_evidence else config.daily_lookback_days,
+                    source=config.daily_source,
+                    fetch_retries=config.daily_fetch_retries,
+                    cache_dir=config.daily_history_cache_dir,
+                    cache_ttl_seconds=config.daily_history_cache_ttl_hours * 3600,
+                    max_workers=config.daily_fetch_max_workers,
+                    history_fetcher=daily_history_fetcher,
+                    strict_signal_date=(date.fromisoformat(snapshot_df.attrs['signal_date'])
+                                        if strict_evidence and snapshot_df.attrs.get('signal_date') else None),
+                )
             daily_enriched = True
+            if strict_evidence:
+                # A successful fetch count alone does not establish complete
+                # calculation evidence. Reuse the frozen schema/value guard.
+                _merge_frozen_daily_features(
+                    daily_candidates, enriched.loc[:, ["code", *_DAILY_FEATURE_DEFAULTS]], screening=screening
+                )
             daily_errors = [str(item) for item in enriched.attrs.get("daily_errors", [])]
             daily_enrich_count = int(enriched.attrs.get("daily_success_count", len(enriched)))
+            if strict_evidence and daily_enrich_count != enrich_count:
+                raise RuntimeError("Incomplete daily evidence: required candidate enrichment failed")
             daily_source_counts = dict(enriched.attrs.get("daily_source_counts", {}) or {})
             daily_quality_flag_counts = dict(enriched.attrs.get("daily_quality_flag_counts", {}) or {})
             daily_source_order_notes = [str(item) for item in enriched.attrs.get("daily_source_order_notes", [])]
@@ -298,6 +353,8 @@ def screen(
             else:
                 df = enriched
         except Exception as exc:
+            if compute_only or frozen_daily_features is not None:
+                raise
             if daily_needed:
                 raise RuntimeError(
                     "Daily K-line enrichment is required by this strategy but failed: "
@@ -335,6 +392,8 @@ def screen(
         len(df),
     )
     df_top = df.head(top_k)
+    if compute_only:
+        df_top = df
 
     # 6. Build Pick list
     picks = _df_to_picks(df_top)
@@ -342,7 +401,8 @@ def screen(
     # 6.5. Host-provided candidate context, e.g. DSA realtime quote,
     # fundamentals, and news. This runs before LLM ranking so L2 can use it.
     _emit_progress(progress_callback, 52, "正在补充候选行情与基本面")
-    degradation.extend(apply_dsa_provider_context(picks, context))
+    if not compute_only:
+        degradation.extend(apply_dsa_provider_context(picks, context))
     llm_fallback_picks = [copy.deepcopy(pick) for pick in picks]
 
     # 7. L2 LLM ranking
@@ -474,6 +534,8 @@ def screen(
             max_same_sector=config.portfolio_max_same_llm_sector,
             concentration_penalty=config.portfolio_concentration_penalty,
             profile=screening.portfolio_profile,
+            canonical_only=screening.evidence_mode == 'daily_required',
+            signal_date=snapshot_df.attrs.get('signal_date'),
         )
 
     # 10. Selection variant application moved below so rotation occurs after
@@ -521,6 +583,7 @@ def screen(
         max_output=output_count,
         seed=selection_seed,
         period=(
+            "" if compute_only else
             f"{datetime.now(timezone.utc).date().isoformat()}"
             f":{market}:{strategy}:{run_id}"
         ),
@@ -565,6 +628,80 @@ def screen(
     )
 
 
+def _copy_frozen_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    copied = frame.copy(deep=True).reset_index(drop=True)
+    copied.attrs = copy.deepcopy(frame.attrs)
+    return copied
+
+
+def _provisional_candidates(df: pd.DataFrame, screening) -> pd.DataFrame:
+    """The shared first-N planning order; no separate delivery scoring formula."""
+    return _sort_screened_candidates(compute_screen_scores(df, screening), screening)
+
+
+def _merge_frozen_daily_features(
+    candidates: pd.DataFrame, features: pd.DataFrame | None,
+    *, screening: ScreeningConfig | None = None,
+) -> pd.DataFrame:
+    if features is None:
+        raise ValueError("frozen daily features are required for the planned candidates")
+    new_flags = {"volume_contracting", "pullback_converging", "breakout_confirmed"}
+    required_flags = set(required_daily_fields(screening)) & new_flags if screening is not None else set()
+    allowed = {"code", *_DAILY_FEATURE_DEFAULTS}
+    # Preserve the pre-2.0 frozen contract unless a strategy opts into the
+    # complete evidence mode or explicitly enables one of the new filters.
+    required = (allowed - new_flags) | required_flags
+    if features.columns.has_duplicates or not required <= set(features.columns):
+        raise ValueError("malformed frozen daily feature schema")
+    if set(features.columns) - allowed:
+        raise ValueError("frozen daily features must not overwrite snapshot/scoring columns")
+    frame = _copy_frozen_frame(features)
+    codes = frame["code"].tolist()
+    if any(not isinstance(code, str) or len(code) != 6 or not code.isascii() or not code.isdigit() for code in codes):
+        raise ValueError("frozen daily feature codes must be canonical")
+    if frame["code"].duplicated().any():
+        raise ValueError("duplicate frozen daily feature codes")
+    planned = candidates["code"].tolist()
+    if not set(planned) <= set(codes):
+        raise ValueError("missing frozen daily features for planned code")
+    frame = frame.set_index("code").loc[planned].reset_index()
+    for name in _DAILY_FEATURE_DEFAULTS:
+        if name not in frame:
+            continue
+        for value in frame[name]:
+            if name in new_flags and name not in required_flags and pd.isna(value):
+                continue
+            if name in {"ma_bullish", "price_above_ma20", "volume_contracting", "pullback_converging", "breakout_confirmed"}:
+                if not isinstance(value, (bool, np.bool_)):
+                    raise ValueError("invalid boolean daily feature")
+            elif name == "macd_status":
+                if value not in {"bullish", "bearish", "neutral"}:
+                    raise ValueError("invalid MACD status")
+            elif name == "rsi_status":
+                if value not in {"oversold", "overbought", "neutral"}:
+                    raise ValueError("invalid RSI status")
+            elif name in {"daily_source", "daily_quality_flags"}:
+                if not isinstance(value, str) or (name == "daily_source" and not value.strip()):
+                    raise ValueError("invalid daily source/quality flags")
+            else:
+                # Only legacy custom contracts retain optional RSI. Strict
+                # 61-bar histories have a defined RSI even with zero losses.
+                if (name == "rsi14" and (screening is None or screening.evidence_mode != "daily_required")
+                        and (value is None or pd.isna(value))):
+                    continue
+                if isinstance(value, (bool, np.bool_)) or not math.isfinite(float(value)):
+                    raise ValueError("invalid numeric daily feature")
+                if name == 'rsi14' and not 0 <= float(value) <= 100:
+                    raise ValueError('invalid RSI numeric domain')
+    # Join by identity, never by potentially duplicated caller indexes. The quote
+    # columns and provisional order come exclusively from the snapshot pool.
+    clean = candidates.drop(columns=[name for name in _DAILY_FEATURE_DEFAULTS if name in candidates.columns])
+    merged = clean.merge(frame, on="code", how="left", sort=False, validate="one_to_one")
+    merged.attrs = copy.deepcopy(candidates.attrs)
+    merged.attrs["daily_success_count"] = len(planned)
+    return merged
+
+
 def _emit_progress(
     callback: Callable[[int, str], None] | None,
     progress: int,
@@ -603,6 +740,14 @@ def _df_to_picks(df: pd.DataFrame) -> list[Pick]:
             pe_ratio=_safe_float(row.get("pe_ratio", row.get("市盈率"))),
             pb_ratio=_safe_float(row.get("pb_ratio", row.get("市净率"))),
             industry=_safe_text(row.get("industry", row.get("行业", row.get("所属行业", "")))),
+            industry_taxonomy=_safe_text(row.get('industry_taxonomy')),
+            industry_code=_safe_text(row.get('industry_code')),
+            industry_as_of=_safe_text(row.get('industry_as_of')),
+            industry_source=_safe_text(row.get('industry_source')),
+            industry_evidence_id=_safe_text(row.get('industry_evidence_id')),
+            dividend_yield_ttm_pct=_safe_float(row.get('dividend_yield_ttm_pct')),
+            dividend_yield_ttm_as_of=_safe_text(row.get('dividend_yield_ttm_as_of')),
+            dividend_yield_ttm_unit=_safe_text(row.get('dividend_yield_ttm_unit')),
             concepts=_safe_text(row.get("concepts", row.get("概念", row.get("概念题材", "")))),
             industry_rank=_safe_int(row.get("industry_rank")),
             industry_change_pct=_safe_float(row.get("industry_change_pct")),

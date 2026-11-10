@@ -24,6 +24,7 @@ from src.report_language import (
     get_bias_status_emoji,
     get_localized_stock_name,
     get_report_labels,
+    market_snapshot_presentation,
     get_signal_level,
     get_chip_unavailable_reason,
     is_chip_structure_unavailable,
@@ -1312,6 +1313,8 @@ class HistoryService:
                         "",
                     ])
 
+        if data_persp.get('chip_source_note'):
+            report_lines.extend([str(data_persp['chip_source_note']), ""])
         # ========== 作战计划 ==========
         battle = dashboard.get('battle_plan', {}) if dashboard else {}
         if battle:
@@ -1580,16 +1583,21 @@ class HistoryService:
         if not snapshot:
             return
 
+        presentation = market_snapshot_presentation(snapshot, getattr(result, 'report_language', 'zh'))
         lines.extend([
-            f"### 📈 {labels['market_snapshot_heading']}",
+            f"### 📈 {presentation['heading']}",
+            "",
+            f"> {presentation['evidence']}",
             "",
             f"| {labels['price_metrics_label']} | {labels['current_price_label']} |",
             "|------|------|",
         ])
 
         # Price info
-        current_price = snapshot.get('price') or snapshot.get('current_price') or result.current_price
-        change_pct = snapshot.get('change_pct') or snapshot.get('pct_chg') or result.change_pct
+        current_price = next((snapshot[key] for key in ('close', 'price', 'current_price')
+                              if snapshot.get(key) is not None), None)
+        change_pct = next((snapshot[key] for key in ('pct_chg', 'change_pct')
+                           if snapshot.get(key) is not None), None)
         if current_price is not None:
             current_str = HistoryService._safe_format_number(current_price, ".2f")
             if change_pct is not None:
@@ -1599,7 +1607,7 @@ class HistoryService:
                     change_str = f"{HistoryService._safe_format_number(change_pct, '+.2f')}%"
             else:
                 change_str = "--"
-            lines.append(f"| {labels['current_price_label']} | **{current_str}** ({change_str}) |")
+            lines.append(f"| {presentation['price_label']} | **{current_str}** ({change_str}) |")
 
         # Other metrics
         metrics = [

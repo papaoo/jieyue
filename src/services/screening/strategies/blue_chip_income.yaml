@@ -3,8 +3,8 @@
 # 蓝筹收益质量策略
 name: blue_chip_income
 display_name: 蓝筹收益质量
-description: 面向高流动性大盘蓝筹的收益质量候选，强调合理估值、稳定成交和防守型持有体验
-version: "1.0"
+description: 面向高流动性大盘股的估值与稳定性代理候选，未验证分红收益或财务质量
+version: "2.1"
 category: income
 tags: [value, quality, income, blue_chip, defensive, snapshot_only]
 style:
@@ -16,6 +16,7 @@ style:
   ui_badge: 蓝筹收益
 
 screening:
+  evidence_mode: daily_required
   enabled: true
   market_scope: [cn]
   hard_filters:
@@ -80,5 +81,5 @@ screening:
     优先关注：
     1. 大市值、高成交额且估值没有明显透支的蓝筹或红利资产
     2. 成交与换手稳定，不依赖单日脉冲量能或短线题材拉升
-    3. 行业地位、现金流、分红稳定性或防守属性能解释持有逻辑
+    3. 行业地位、现金流与分红稳定性需独立核验，不作为已验证收入质量
   max_output: 5

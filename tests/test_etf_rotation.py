@@ -404,10 +404,11 @@ def test_run_etf_rotation_reports_failures_and_sends_report():
     )
 
     assert report.failed_codes.keys() == {"BROKEN"}
-    assert report.target_weights == {"B": 1.0}
-    for section in ("最新信号", "回测表现", "分年度收益", "参数平原检验", "规则说明", "BROKEN"):
+    assert report.target_weights == {}
+    assert report.data_quality == 'blocked'
+    for section in ("数据验收未通过", "BROKEN"):
         assert section in report.markdown
-    assert "进攻ETF(A)" in report.markdown
+    assert '回测表现（' not in report.markdown
     notifier.save_report_to_file.assert_called_once()
     notifier.send.assert_called_once_with(report.markdown, route_type="report")
 
@@ -427,7 +428,7 @@ def test_run_etf_rotation_survives_save_and_send_errors():
     report = run_etf_rotation(_config(), send_notification=True, end=_regime_closes().index[-1].date(),
                               fetcher_manager=_FakeFetcher(_regime_closes(), broken={"BROKEN"}), notifier=notifier)
 
-    assert "最新信号" in report.markdown
+    assert "数据验收未通过" in report.markdown
     notifier.send.assert_called_once()  # a failed save does not skip the push
 
 
@@ -437,7 +438,8 @@ def test_run_etf_rotation_treats_malformed_frame_as_single_failure():
         fetcher_manager=_FakeFetcher(_regime_closes(), malformed={"B"}), notifier=_notifier(),
     )
     assert "date" in report.failed_codes["B"]
-    assert report.target_weights
+    assert not report.target_weights
+    assert report.data_quality == 'blocked'
 
 
 def test_load_closes_drops_bars_after_end():
@@ -617,13 +619,16 @@ def test_no_rebalance_flag_when_top_n_holdings_unchanged_after_drift():
     assert "维持不变" in report.markdown
 
 
-def test_missing_safe_asset_falls_back_to_cash_with_warning():
+def test_missing_configured_safe_asset_blocks_different_strategy_metrics():
     closes = _regime_closes()
     report = build_report(
         closes[["A", "B"]], ["A", "B"], "SAFE", RotationParams(lookback_days=20),
         names={}, warnings=["SAFE 数据获取失败"],
     )
-    assert "防守资产 SAFE 不可用" in report.markdown
+    assert report.data_quality == 'blocked'
+    assert report.target_weights == {}
+    assert '回测表现（' not in report.markdown
+    assert 'SAFE' in report.markdown
 
 
 def test_data_quality_warnings_flag_truncation_jumps_and_mixed_sources():
@@ -648,6 +653,65 @@ def test_clean_data_produces_no_warnings():
     closes = _regime_closes()
     loaded = LoadedPrices(closes, closes.index[0].date(), sources={c: "EfinanceFetcher" for c in closes})
     assert data_quality_warnings(loaded) == []
+
+
+def test_report_blocks_split_artifact_even_without_caller_warnings():
+    closes = _regime_closes()
+    closes.loc[closes.index[100]:, 'A'] *= 0.2
+    report = build_report(closes, ['A', 'B'], 'SAFE', RotationParams(lookback_days=20), {})
+    assert report.target_weights == {}
+    assert report.data_quality == 'blocked'
+    assert '数据验收未通过' in report.markdown
+    assert '回测表现（' not in report.markdown
+    assert '参数平原检验（' not in report.markdown
+
+
+def test_rotation_retries_after_semantically_invalid_adjusted_history(monkeypatch):
+    from data_provider.base import DataFetcherManager
+    bad = pd.DataFrame({'date': _dates(40), 'close': [10.] * 20 + [2.] * 20})
+    good = pd.DataFrame({'date': _dates(40), 'close': np.linspace(2, 2.1, 40)})
+    providers = [SimpleNamespace(name='BaostockFetcher', priority=0),
+                 SimpleNamespace(name='AkshareFetcher', priority=1)]
+    manager = DataFetcherManager(fetchers=providers)
+    called = []
+
+    def get_daily(self, *args, **kwargs):
+        provider = self._get_fetchers_snapshot()[0].name
+        called.append(provider)
+        return (bad if provider == 'BaostockFetcher' else good).copy(), provider
+
+    monkeypatch.setattr(DataFetcherManager, 'get_daily_data', get_daily)
+    loaded = load_closes(manager, ['513100'], 1, end=_dates(40)[-1].date())
+    assert loaded.sources == {'513100': 'AkshareFetcher'}
+    assert called == ['BaostockFetcher', 'AkshareFetcher']
+    assert loaded.rejected['513100']
+    assert not loaded.failed
+
+
+def test_report_does_not_shrink_missing_research_universe_silently():
+    report = build_report(_regime_closes(), ['A', 'B', 'MISSING'], 'SAFE', RotationParams(), {})
+    assert report.target_weights == {}
+    assert 'MISSING' in report.markdown
+    assert report.data_quality == 'blocked'
+
+
+def test_rotation_tencent_fallback_pages_yearly_and_requires_adjustment(monkeypatch):
+    from data_provider.base import DataFetcherManager
+    provider = SimpleNamespace(name='TencentFetcher', priority=5)
+    calls = []
+
+    def get_daily(self, code, start_date, end_date):
+        calls.append((pd.Timestamp(start_date), pd.Timestamp(end_date)))
+        frame = pd.DataFrame({'date': pd.bdate_range(start_date, end_date), 'close': 2.})
+        frame.attrs['price_adjustment'] = 'forward'
+        return frame, 'TencentFetcher'
+
+    monkeypatch.setattr(DataFetcherManager, 'get_daily_data', get_daily)
+    loaded = load_closes(DataFetcherManager(fetchers=[provider]), ['513100'], 3, end=pd.Timestamp('2026-10-09').date())
+    assert loaded.sources == {'513100': 'TencentFetcher'}
+    assert len(calls) >= 3
+    assert all((end - start).days <= 365 for start, end in calls)
+    assert not loaded.failed
 
 
 # --- config ----------------------------------------------------------------------

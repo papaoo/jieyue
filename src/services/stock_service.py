@@ -111,54 +111,95 @@ class StockService:
                 f"暂不支持 '{period}' 周期，目前仅支持 'daily'。"
                 "weekly/monthly 聚合功能将在后续版本实现。"
             )
-        
+
+        import math
+        from datetime import timezone
+
+        def finite_number(value: Any) -> Optional[float]:
+            try:
+                number = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return number if math.isfinite(number) else None
+
+        response = {
+            "stock_code": stock_code,
+            "stock_name": None,
+            "period": period,
+            "data": [],
+            "source": None,
+            "status": "unavailable",
+            "warnings": ["daily-not-realtime", "adjustment-unknown", "freshness-not-verified"],
+            "adjustment": None,
+        }
         try:
             # 调用数据获取器获取历史数据
             from data_provider.base import DataFetcherManager
             
             manager = DataFetcherManager()
             df, source = manager.get_daily_data(stock_code, days=days)
-            
+            response["source"] = source if isinstance(source, str) and source.strip() else None
+
             if df is None or df.empty:
-                logger.warning(f"获取 {stock_code} 历史数据失败")
-                return {"stock_code": stock_code, "period": period, "data": []}
-            
+                response["status"] = "empty"
+                response["warnings"].append("empty-result")
+                return response
+
             # 获取股票名称
-            stock_name = manager.get_stock_name(stock_code)
-            
+            response["stock_name"] = manager.get_stock_name(stock_code)
+
             # 转换为响应格式
             data = []
+            invalid_price_rows = 0
+            missing_optional = set()
             for _, row in df.iterrows():
+                prices = {field: finite_number(row.get(field)) for field in ("open", "high", "low", "close")}
+                if any(value is None or value <= 0 for value in prices.values()):
+                    invalid_price_rows += 1
+                    continue
+                if (
+                    prices["high"] < max(prices["open"], prices["close"], prices["low"])
+                    or prices["low"] > min(prices["open"], prices["close"], prices["high"])
+                ):
+                    invalid_price_rows += 1
+                    continue
                 date_val = row.get("date")
                 if hasattr(date_val, "strftime"):
                     date_str = date_val.strftime("%Y-%m-%d")
                 else:
                     date_str = str(date_val)
                 
+                optional_values = {
+                    "volume": finite_number(row.get("volume")),
+                    "amount": finite_number(row.get("amount")),
+                    "change_percent": finite_number(row.get("pct_chg")),
+                }
+                missing_optional.update(field for field, value in optional_values.items() if value is None)
                 data.append({
                     "date": date_str,
-                    "open": float(row.get("open", 0)),
-                    "high": float(row.get("high", 0)),
-                    "low": float(row.get("low", 0)),
-                    "close": float(row.get("close", 0)),
-                    "volume": float(row.get("volume", 0)) if row.get("volume") else None,
-                    "amount": float(row.get("amount", 0)) if row.get("amount") else None,
-                    "change_percent": float(row.get("pct_chg", 0)) if row.get("pct_chg") else None,
+                    **prices,
+                    **optional_values,
                 })
-            
-            return {
-                "stock_code": stock_code,
-                "stock_name": stock_name,
-                "period": period,
-                "data": data,
-            }
-            
-        except ImportError:
-            logger.warning("DataFetcherManager 未找到，返回空数据")
-            return {"stock_code": stock_code, "period": period, "data": []}
+
+            if invalid_price_rows:
+                response["warnings"].append(f"invalid-ohlc-rows-skipped:{invalid_price_rows}")
+            if missing_optional:
+                response["warnings"].append(f"optional-fields-missing:{','.join(sorted(missing_optional))}")
+            if response["source"] is None:
+                response["warnings"].append("source-unknown")
+            response["data"] = data
+            response["status"] = (
+                "partial" if invalid_price_rows or missing_optional or response["source"] is None else "available"
+            )
+            return response
+
         except Exception as e:
-            logger.error(f"获取历史数据失败: {e}", exc_info=True)
-            return {"stock_code": stock_code, "period": period, "data": []}
+            logger.error("获取历史数据失败: %s", type(e).__name__)
+            response["warnings"].append("source-unavailable")
+            return response
+        finally:
+            # Request completion time, not the market observation/bar timestamp.
+            response["fetched_at"] = datetime.now(timezone.utc).isoformat()
     
     def _get_placeholder_quote(self, stock_code: str) -> Dict[str, Any]:
         """

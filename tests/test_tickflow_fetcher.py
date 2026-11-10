@@ -163,6 +163,12 @@ def _quote(symbol, *, last_price=11.0, prev_close=10.0, amount=1000.0, volume=10
 
 
 class TestTickFlowFetcher(unittest.TestCase):
+    def setUp(self):
+        TickFlowFetcher._request_budget.clear()
+
+    def tearDown(self):
+        TickFlowFetcher._request_budget.clear()
+
     def test_daily_kline_normalizes_units_and_pct_change(self):
         fetcher = TickFlowFetcher(api_key="sk-test")
         fetcher._client = _FakeClient(daily_data=_daily_rows())
@@ -403,8 +409,9 @@ class TestTickFlowFetcher(unittest.TestCase):
         fetcher = TickFlowFetcher(api_key="sk-test")
         fetcher._client = _FakeClient(universe_data=_PermissionLikeError("universe forbidden"))
 
-        with patch("data_provider.tickflow_fetcher.monotonic", side_effect=[100.0, 100.0, 1001.0, 1001.0]):
+        with patch("data_provider.tickflow_fetcher.monotonic", return_value=100.0) as clock:
             self.assertIsNone(fetcher.get_market_stats())
+            clock.return_value = 1001.0
             self.assertIsNone(fetcher.get_market_stats())
 
         self.assertEqual(len(fetcher._client.quotes.calls), 2)

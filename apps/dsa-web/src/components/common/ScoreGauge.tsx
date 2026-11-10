@@ -4,6 +4,7 @@ import { useTheme } from 'next-themes';
 import { getSentimentLabel, type ReportLanguage } from '../../types/analysis';
 import { cn } from '../../utils/cn';
 import { normalizeReportLanguage, getReportText } from '../../utils/reportLanguage';
+import { useMotionPreference } from '../../contexts/MotionPreferenceContext';
 
 interface ScoreGaugeProps {
   score: number;
@@ -41,9 +42,14 @@ export const ScoreGauge: React.FC<ScoreGaugeProps> = ({
   const prevScoreRef = useRef(0);
   const { resolvedTheme } = useTheme();
   const isDark = resolvedTheme === 'dark';
+  const { motionEnabled } = useMotionPreference();
 
   // Animate transitions between score updates.
   useEffect(() => {
+    if (!motionEnabled) {
+      prevScoreRef.current = score;
+      return;
+    }
     const startScore = prevScoreRef.current;
     const endScore = score;
     const duration = 1000; // Animation duration in ms.
@@ -74,7 +80,7 @@ export const ScoreGauge: React.FC<ScoreGaugeProps> = ({
         cancelAnimationFrame(animationRef.current);
       }
     };
-  }, [score]);
+  }, [score, motionEnabled]);
 
   const reportLanguage = normalizeReportLanguage(language);
   const text = getReportText(reportLanguage);
@@ -93,7 +99,8 @@ export const ScoreGauge: React.FC<ScoreGaugeProps> = ({
 
   // Start from the top and render a 270-degree arc.
   const arcLength = circumference * 0.75;
-  const progress = (animatedScore / 100) * arcLength;
+  const renderedScore = motionEnabled ? animatedScore : score;
+  const progress = (renderedScore / 100) * arcLength;
 
   // Sentiment colors - dynamically computed based on score thresholds.
   // Light theme uses a restrained glow; dark theme keeps the stronger terminal-style glow.
@@ -125,7 +132,7 @@ export const ScoreGauge: React.FC<ScoreGaugeProps> = ({
     return 'fear';
   };
 
-  const sentimentKey = getSentimentKey(animatedScore);
+  const sentimentKey = getSentimentKey(renderedScore);
   const colors = sentimentConfig[sentimentKey];
   const uniqueId = `${sentimentKey}-${score}-${animatedScore.toFixed(0)}`;
   const gaugeTheme: GaugeVisualStyle = isDark
@@ -231,7 +238,7 @@ export const ScoreGauge: React.FC<ScoreGaugeProps> = ({
             className={cn('font-bold', fontSize, isDark ? 'text-white' : 'text-foreground')}
             style={gaugeTheme.valueTextShadow ? { textShadow: gaugeTheme.valueTextShadow } : {}}
           >
-            {displayScore}
+            {motionEnabled ? displayScore : Math.round(score)}
           </span>
           {showLabel && (
             <span

@@ -49,7 +49,7 @@ export function formatPositionPrice(row: PortfolioPositionItem): string {
 }
 
 export function formatPositionMoney(value: number, row: PortfolioPositionItem): string {
-  if (!hasPositionPrice(row)) return '--';
+  if (!hasPositionPrice(row) || row.valuationComplete === false) return '--';
   return formatMoney(value, row.valuationCurrency);
 }
 

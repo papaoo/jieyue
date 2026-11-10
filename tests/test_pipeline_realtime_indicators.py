@@ -33,6 +33,7 @@ def _make_realtime_quote(
     change_pct: float = 0.96,
     **overrides,
 ) -> UnifiedRealtimeQuote:
+    overrides.setdefault('provider_timestamp', date.today().isoformat() + 'T06:00:00+00:00')
     return UnifiedRealtimeQuote(
         code="600519",
         name="贵州茅台",
@@ -226,7 +227,9 @@ class TestEnhanceContextRealtimeOverride(unittest.TestCase):
         self.assertEqual(enhanced["today"]["data_source"], "realtime:tencent")
         self.assertEqual(enhanced["today"]["realtime_source"], "tencent")
         self.assertIn("price_change_ratio", enhanced)
-        self.assertIn("volume_change_ratio", enhanced)
+        # The completed latest bar has no volume in this fixture; D-2 volume
+        # cannot be silently relabeled as yesterday's baseline.
+        self.assertNotIn("volume_change_ratio", enhanced)
 
     @patch("src.core.pipeline.get_market_now")
     @patch("src.core.pipeline.get_market_for_stock", return_value="cn")
@@ -260,6 +263,7 @@ class TestEnhanceContextRealtimeOverride(unittest.TestCase):
             volume=10931723,
             amount=1327404280,
             change_pct=3.40,
+            provider_timestamp=today.isoformat() + 'T06:00:00+00:00',
         )
         trend = TrendAnalysisResult(
             code="688691",
@@ -286,7 +290,7 @@ class TestEnhanceContextRealtimeOverride(unittest.TestCase):
     def test_realtime_metadata_and_partial_estimated_fields_are_propagated(
         self, _mock_market, mock_now
     ) -> None:
-        today = date.today()
+        today = date(2026, 5, 31)
         mock_now.return_value = datetime(
             today.year, today.month, today.day, 10, 0, tzinfo=timezone.utc
         )

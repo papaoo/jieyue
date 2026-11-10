@@ -163,6 +163,9 @@ def _compact_fundamental_context(fundamental_context: dict) -> dict:
             compact[block] = {
                 "status": payload.get("status"),
                 "data": payload.get("data", {}),
+                "source_chain": payload.get("source_chain", []),
+                "fetched_at": payload.get("fetched_at"),
+                "missing_fields": payload.get("missing_fields", []),
             }
         else:
             compact[block] = {"status": "failed", "data": {}}
@@ -177,7 +180,14 @@ def _compact_portfolio_snapshot(snapshot: dict, include_positions: bool = False,
     for account in snapshot.get("accounts", []) or []:
         if not isinstance(account, dict):
             continue
-        positions = list(account.get("positions") or [])
+        positions = [dict(position) for position in account.get("positions") or []]
+        for position in positions:
+            if position.get("valuation_complete") is False:
+                position["market_value_base"] = None
+                position["unrealized_pnl_base"] = None
+                position["unrealized_pnl_pct"] = None
+            if position.get("price_available") is False:
+                position["last_price"] = None
         positions = sorted(
             positions,
             key=lambda item: float((item or {}).get("market_value_base") or 0.0),
@@ -194,7 +204,13 @@ def _compact_portfolio_snapshot(snapshot: dict, include_positions: bool = False,
             "realized_pnl": account.get("realized_pnl"),
             "unrealized_pnl": account.get("unrealized_pnl"),
             "fx_stale": account.get("fx_stale"),
+            "valuation_complete": account.get("valuation_complete", True),
+            "data_quality": account.get("data_quality", "ok"),
+            "limitations": account.get("limitations", []),
         }
+        if account.get("valuation_complete") is False:
+            for field in ("total_equity", "total_market_value", "total_cash", "realized_pnl", "unrealized_pnl"):
+                account_payload[field] = None
         if include_positions:
             account_payload["positions"] = positions
         else:
@@ -202,7 +218,7 @@ def _compact_portfolio_snapshot(snapshot: dict, include_positions: bool = False,
             account_payload["top_positions"] = positions[:top_n]
         compact_accounts.append(account_payload)
 
-    return {
+    compact = {
         "as_of": snapshot.get("as_of"),
         "cost_method": snapshot.get("cost_method"),
         "currency": snapshot.get("currency"),
@@ -213,8 +229,15 @@ def _compact_portfolio_snapshot(snapshot: dict, include_positions: bool = False,
         "realized_pnl": snapshot.get("realized_pnl"),
         "unrealized_pnl": snapshot.get("unrealized_pnl"),
         "fx_stale": snapshot.get("fx_stale"),
+        "valuation_complete": snapshot.get("valuation_complete", True),
+        "data_quality": snapshot.get("data_quality", "ok"),
+        "limitations": snapshot.get("limitations", []),
         "accounts": compact_accounts,
     }
+    if snapshot.get("valuation_complete") is False:
+        for field in ("total_equity", "total_market_value", "total_cash", "realized_pnl", "unrealized_pnl"):
+            compact[field] = None
+    return compact
 
 
 def _compact_portfolio_risk(risk: dict, top_n: int = 10) -> dict:
@@ -242,17 +265,23 @@ def _compact_portfolio_risk(risk: dict, top_n: int = 10) -> dict:
         "cost_method": risk.get("cost_method"),
         "thresholds": risk.get("thresholds", {}),
         "concentration": {
+            "available": concentration.get("available", True),
+            "reason": concentration.get("reason", ""),
             "alert": concentration.get("alert", False),
             "top_weight_pct": concentration.get("top_weight_pct"),
             "top_positions": top_positions,
         },
         "drawdown": {
+            "available": drawdown.get("available", True),
+            "reason": drawdown.get("reason", ""),
             "alert": drawdown.get("alert", False),
             "max_drawdown_pct": drawdown.get("max_drawdown_pct"),
             "current_drawdown_pct": drawdown.get("current_drawdown_pct"),
             "fx_stale": drawdown.get("fx_stale", False),
         },
         "stop_loss": {
+            "available": stop_loss.get("available", True),
+            "reason": stop_loss.get("reason", ""),
             "near_alert": stop_loss.get("near_alert", False),
             "triggered_count": stop_loss.get("triggered_count", 0),
             "near_count": stop_loss.get("near_count", 0),
@@ -297,6 +326,12 @@ def _handle_get_realtime_quote(stock_code: str) -> dict:
         "circ_mv": quote.circ_mv,
         "change_60d": quote.change_60d,
         "source": quote.source.value if hasattr(quote.source, 'value') else str(quote.source),
+        "provider_timestamp": getattr(quote, 'provider_timestamp', None),
+        "fetched_at": getattr(quote, 'fetched_at', None),
+        "is_stale": getattr(quote, 'is_stale', None),
+        "volume_unit": "shares",
+        "currency": getattr(quote, 'currency', None),
+        "data_quality": getattr(quote, 'data_quality', None),
     }
 
 
@@ -406,13 +441,16 @@ get_daily_history_tool = ToolDefinition(
 def _handle_get_chip_distribution(stock_code: str) -> dict:
     """Get chip distribution data."""
     manager = _get_fetcher_manager()
-    chip = manager.get_chip_distribution(stock_code)
+    result = manager.get_chip_distribution(stock_code, with_metadata=True)
+    chip, evidence = result if isinstance(result, tuple) and len(result) == 2 else (result, {})
 
     if chip is None:
-        return {"error": f"No chip distribution data available for {stock_code}"}
+        return {"error": f"No chip distribution data available for {stock_code}", "data_quality": evidence}
 
     return {
         "code": chip.code,
+        "data_quality": evidence,
+        "method": "estimated_cost_distribution_not_actual_positions_or_future_win_rate",
         "date": chip.date,
         "source": chip.source,
         "profit_ratio": chip.profit_ratio,
@@ -677,7 +715,12 @@ def _handle_get_capital_flow(stock_code: str) -> dict:
     """Get main-force capital flow data for a stock."""
     manager = _get_fetcher_manager()
     try:
-        ctx = manager.get_capital_flow_context(stock_code)
+        unified = getattr(manager, 'get_fundamental_context', None)
+        snapshot = getattr(manager, '_get_fetchers_snapshot', None)
+        # Do not turn a legacy single-block tool into a full seven-block fetch
+        # when no native integration exists (or on an older manager).
+        has_native = (not callable(snapshot) or any(callable(getattr(f, 'get_fundamental_snapshot', None)) for f in snapshot()))
+        ctx = unified(stock_code).get('capital_flow', {}) if callable(unified) and has_native else manager.get_capital_flow_context(stock_code)
     except Exception as exc:
         logger.warning("get_capital_flow failed for %s: %s", stock_code, exc)
         return {
@@ -705,9 +748,17 @@ def _handle_get_capital_flow(stock_code: str) -> dict:
         "main_net_inflow": stock_flow.get("main_net_inflow"),
         "inflow_5d": stock_flow.get("inflow_5d"),
         "inflow_10d": stock_flow.get("inflow_10d"),
+        "as_of": stock_flow.get("as_of"),
+        "unit": stock_flow.get("unit"),
+        "definition": stock_flow.get("definition"),
+        "source_chain": ctx.get("source_chain", []),
+        "missing_fields": ctx.get("missing_fields", []),
         "sector_rankings": {
             "top_inflow_sectors": sector_rankings.get("top", [])[:3],
             "top_outflow_sectors": sector_rankings.get("bottom", [])[:3],
+            **{key: sector_rankings.get(key) for key in (
+                'definition', 'definition_warning', 'as_of', 'coverage_complete', 'membership_basis',
+                'traded_count', 'mapped_count', 'related_industry', 'source')},
         },
         "errors": errors,
     }
@@ -717,7 +768,7 @@ get_capital_flow_tool = ToolDefinition(
     name="get_capital_flow",
     description=(
         "Get main-force (主力) capital flow data for an A-share stock. "
-        "Returns today's net inflow, 5-day and 10-day cumulative inflows, "
+        "Returns dated latest available closed-session net inflow, 5-day and 10-day cumulative inflows, "
         "and top sector-level capital flow rankings. "
         "Only supported for A-share individual stocks (not ETFs, indices, HK, or US stocks)."
     ),

@@ -6,9 +6,10 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import threading
@@ -22,6 +23,9 @@ from src.core.trading_calendar import MarketPhase, build_market_phase_context, g
 from src.services.screening.source_guard import call_with_timeout, parse_source_timeout_seconds
 
 _DAILY_FEATURE_DEFAULTS = {
+    "volume_contracting": pd.NA,
+    "pullback_converging": pd.NA,
+    "breakout_confirmed": pd.NA,
     "daily_data_points": pd.NA,
     "change_60d": pd.NA,
     "ma5": pd.NA,
@@ -47,13 +51,54 @@ _DAILY_FEATURE_DEFAULTS = {
     "daily_quality_flags": "",
     "daily_source": "",
 }
+STRICT_HISTORY_DAYS = 300
+
+
+def strict_history_start(signal_date: date) -> date:
+    """Formal/replay input convention: inclusive 300-calendar-day lookback."""
+    return signal_date - timedelta(days=STRICT_HISTORY_DAYS)
+
+
+def strict_history_window(history: pd.DataFrame, signal_date: date) -> pd.DataFrame:
+    """Validate chronology before trimming; never hide future/duplicate rows."""
+    if 'date' not in history:
+        raise ValueError('strict_history_dates_missing')
+    dates = pd.to_datetime(history['date'], errors='raise')
+    if (dates.isna().any() or dates.duplicated().any() or not dates.is_monotonic_increasing
+            or any(day.date() > signal_date for day in dates)):
+        raise ValueError('strict_history_chronology_invalid')
+    result = history.loc[dates.dt.date >= strict_history_start(signal_date)].copy()
+    result.attrs = dict(history.attrs)
+    return result
+
+
+def prepare_dated_history(daily, factors, *, code, signal_date, source, evidence_id):
+    """Shared raw-price/factor assembly for formal, ordinary and replay inputs.
+
+    Acquisition adapters verify raw identities and exchange-session coverage.
+    Provider ordering is normalized here; duplicate keys or missing factors fail.
+    """
+    merged = daily.merge(factors, on=['ts_code', 'trade_date'], how='left', validate='one_to_one').sort_values('trade_date')
+    values = pd.to_numeric(merged.adj_factor, errors='raise')
+    if values.empty or values.isna().any() or not values.map(math.isfinite).all() or (values <= 0).any():
+        raise ValueError('history_factor_invalid')
+    dates = pd.to_datetime(merged.trade_date, errors='raise')
+    if dates.iloc[-1].date() != signal_date or any(stamp.date() < strict_history_start(signal_date) for stamp in dates):
+        raise ValueError('history_window_invalid')
+    frame = pd.DataFrame(dict(date=merged.trade_date, volume=pd.to_numeric(merged.vol, errors='raise') * 100))
+    for field in ('open', 'high', 'low', 'close'):
+        frame[field] = pd.to_numeric(merged[field], errors='raise') * values / values.iloc[-1]
+    frame.attrs.update(code=code, daily_source=source, evidence_id=evidence_id,
+                       price_adjustment='forward', volume_unit='shares')
+    return strict_history_window(frame, signal_date)
+
+
 _DAILY_ENRICH_MAX_WORKERS = 1
-_DAILY_HISTORY_CACHE_VERSION = 1
+_DAILY_HISTORY_CACHE_VERSION = 2
 _DAILY_HISTORY_CACHE_TTL_SECONDS = 24 * 60 * 60
 _SOURCE_HEALTH_FAILURE_THRESHOLD = 3
 _SOURCE_HEALTH_COOLDOWN_SECONDS = 5 * 60
 _DAILY_CALL_TIMEOUT_SECONDS = 20.0
-_DEFAULT_TUSHARE_HTTP_URL = "http://api.waditu.com"
 _BAOSTOCK_LOCK = threading.Lock()
 _BAOSTOCK_OUTAGE_ERROR: str | None = None
 _SOURCE_HEALTH: dict[str, dict[str, object]] = {}
@@ -71,6 +116,7 @@ def enrich_daily_features(
     cache_ttl_seconds: float | None = None,
     max_workers: int | None = None,
     history_fetcher: Callable[..., pd.DataFrame] | None = None,
+    strict_signal_date: date | None = None,
 ) -> pd.DataFrame:
     """Attach daily technical features to the first ``max_rows`` candidates.
 
@@ -110,6 +156,8 @@ def enrich_daily_features(
                 cache_dir=cache_dir,
                 cache_ttl_seconds=cache_ttl_seconds,
             )
+            if strict_signal_date is not None:
+                hist = strict_history_window(hist, strict_signal_date)
             if daily_history_is_stale(hist, code=code):
                 hist = hist.copy()
                 hist.attrs["daily_stale"] = True
@@ -268,6 +316,12 @@ def fetch_daily_history(
                         normalized_code,
                         lookback_days=normalized_lookback_days,
                     )
+                if current in {"akshare", "baostock"}:
+                    result.attrs.setdefault("price_adjustment", "forward")
+                if current == "sina":
+                    result.attrs.setdefault("price_adjustment", "none")
+                if src == "auto" and result.attrs.get("price_adjustment") == "none":
+                    raise ValueError("unadjusted daily history cannot replace forward-adjusted screening data")
                 is_stale = daily_history_is_stale(result, code=normalized_code)
                 if is_stale and pd.isna(_latest_daily_bar_date(result, code=normalized_code)):
                     raise ValueError("invalid daily session")
@@ -566,6 +620,8 @@ def _read_daily_history_cache(
         payload = json.loads(path.read_text(encoding="utf-8"))
         if payload.get("version") != _DAILY_HISTORY_CACHE_VERSION:
             return None
+        if payload.get("key", {}).get("tushare_adj", "qfq") != os.getenv("TUSHARE_DAILY_ADJ", "qfq"):
+            return None
         acquired_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
         try:
             parsed_acquired_at = datetime.fromisoformat(payload["created_at"])
@@ -596,7 +652,7 @@ def _read_daily_history_cache(
             df.attrs["daily_invalid_session"] = True
         metadata = payload.get("metadata")
         if isinstance(metadata, dict):
-            for key in ("daily_source", "daily_requested_source", "daily_source_order", "daily_source_order_notes", "source_errors", "daily_source_health", "daily_stale"):
+            for key in ("daily_source", "daily_requested_source", "daily_source_order", "daily_source_order_notes", "source_errors", "daily_source_health", "daily_stale", "price_adjustment"):
                 if key in metadata:
                     df.attrs[key] = metadata[key]
         is_stale = is_stale or daily_history_is_stale(
@@ -629,6 +685,7 @@ def _write_daily_history_cache(
                 "code": code,
                 "source": source,
                 "lookback_days": int(lookback_days),
+                "tushare_adj": os.getenv("TUSHARE_DAILY_ADJ", "qfq"),
             },
             "metadata": {
                 "daily_source": df.attrs.get("daily_source", source),
@@ -638,6 +695,7 @@ def _write_daily_history_cache(
                 "source_errors": list(df.attrs.get("source_errors", [])),
                 "daily_source_health": df.attrs.get("daily_source_health", {}),
                 "daily_stale": bool(df.attrs.get("daily_stale")),
+                "price_adjustment": df.attrs.get("price_adjustment", "unknown"),
             },
             "created_at": datetime.fromtimestamp(time.time(), tz=timezone.utc).isoformat(),
             "frame": json.loads(df.to_json(orient="split", date_format="iso", force_ascii=False)),
@@ -718,6 +776,7 @@ def _fetch_daily_tencent(code: str, *, lookback_days: int) -> pd.DataFrame:
     )
     for col in ("open", "close", "high", "low", "volume", "amount"):
         df[col] = pd.to_numeric(df[col], errors="coerce")
+    df.attrs["price_adjustment"] = "forward" if stock_data.get("qfqday") else "none"
     return df.tail(count).copy()
 
 
@@ -773,10 +832,9 @@ def _fetch_daily_tushare(code: str, *, lookback_days: int) -> pd.DataFrame:
     if not token:
         raise RuntimeError("tushare requires TUSHARE_TOKEN")
 
-    import tushare as ts
+    from data_provider.tushare_fetcher import create_tushare_http_client
 
-    pro = ts.pro_api(token)
-    _configure_tushare_client(pro, token=token)
+    pro = create_tushare_http_client(token)
 
     start_date = (datetime.now() - timedelta(days=max(lookback_days * 2, 90))).strftime("%Y%m%d")
     end_date = datetime.now().strftime("%Y%m%d")
@@ -799,6 +857,8 @@ def _fetch_daily_tushare(code: str, *, lookback_days: int) -> pd.DataFrame:
             end_date=end_date,
             adj=adj,
         )
+    else:
+        df.attrs["price_adjustment"] = "none"
 
     normalized = _normalize_tushare_daily_frame(df)
     return normalized.tail(max(lookback_days, 30)).copy()
@@ -813,23 +873,6 @@ def _tushare_token() -> str:
 
 def _has_tushare_token() -> bool:
     return bool(_tushare_token())
-
-
-def _configure_tushare_client(pro: object, *, token: str) -> None:
-    try:
-        setattr(pro, "_DataApi__token", token)
-    except Exception:
-        pass
-
-    http_url = (
-        os.getenv("TUSHARE_API_URL", "").strip()
-        or os.getenv("TUSHARE_HTTP_URL", "").strip()
-        or _DEFAULT_TUSHARE_HTTP_URL
-    )
-    try:
-        setattr(pro, "_DataApi__http_url", http_url)
-    except Exception:
-        pass
 
 
 def _normalize_tushare_daily_frame(df: pd.DataFrame) -> pd.DataFrame:
@@ -862,20 +905,22 @@ def _apply_tushare_adjustment(
     if factors is None or factors.empty:
         raise RuntimeError(f"tushare adj_factor empty for {ts_code}")
 
-    merged = df.merge(factors, on="trade_date", how="left")
+    factors = factors.sort_values("trade_date").drop_duplicates("trade_date", keep="last")
+    merged = df.merge(factors, on="trade_date", how="left", validate="many_to_one")
     merged = merged.sort_values("trade_date")
-    merged["adj_factor"] = pd.to_numeric(merged["adj_factor"], errors="coerce").bfill()
-    valid_factors = pd.to_numeric(factors["adj_factor"], errors="coerce").dropna()
-    if valid_factors.empty:
-        raise RuntimeError(f"tushare adj_factor invalid for {ts_code}")
-    latest_factor = float(valid_factors.iloc[0])
+    merged["adj_factor"] = pd.to_numeric(merged["adj_factor"], errors="coerce")
+    if merged["adj_factor"].isna().any() or not merged["adj_factor"].map(lambda x: math.isfinite(x) and x > 0).all():
+        raise RuntimeError(f"tushare adj_factor missing or invalid for {ts_code}")
+    latest_factor = float(merged["adj_factor"].iloc[-1])
     for col in ("open", "high", "low", "close"):
         merged[col] = pd.to_numeric(merged[col], errors="coerce")
         if adj == "hfq":
             merged[col] = merged[col] * merged["adj_factor"]
         else:
             merged[col] = merged[col] * merged["adj_factor"] / latest_factor
-    return merged.drop(columns=["adj_factor"])
+    adjusted = merged.drop(columns=["adj_factor"])
+    adjusted.attrs["price_adjustment"] = "backward" if adj == "hfq" else "forward"
+    return adjusted
 
 
 def _normalize_tushare_adj(value: str | None) -> str | None:
@@ -995,6 +1040,36 @@ def compute_daily_features(hist: pd.DataFrame) -> dict[str, object]:
     last_ma20 = _last_float(ma20)
     last_ma60 = _last_float(ma60)
     shape = _compute_shape_features(df, last_close=last_close, last_ma20=last_ma20)
+    # Raw comparisons are deliberately independent of rounded display metrics.
+    prior = df.iloc[:-1].tail(20)
+    volume_contracting = pd.NA
+    breakout_confirmed = pd.NA
+    pullback_converging = pd.NA
+    if len(prior) == 20:
+        if "volume" in df and pd.notna(df["volume"].iloc[-1]) and prior["volume"].notna().all():
+            volumes = [float(v) for v in [*prior["volume"], df["volume"].iloc[-1]]]
+            if all(math.isfinite(v) and v >= 0 for v in volumes):
+                prior_mean = float(prior["volume"].mean())
+                if math.isfinite(prior_mean):
+                    volume_contracting = bool(volumes[-1] < prior_mean)
+        # Normalization may synthesize high from close; that is not breakout evidence.
+        raw = hist.rename(columns={"日期": "date", "收盘": "close", "最高": "high"}).copy()
+        raw["close"] = pd.to_numeric(raw["close"], errors="coerce")
+        if "date" in raw:
+            raw = raw.sort_values("date")
+        raw = raw.dropna(subset=["close"])
+        raw_high_valid = ("high" in raw and
+                          pd.to_numeric(raw["high"].iloc[:-1].tail(20), errors="coerce").notna().all())
+        if raw_high_valid and math.isfinite(last_close) and last_close > 0:
+            highs = prior["high"].astype(float)
+            if all(math.isfinite(v) and v > 0 for v in highs):
+                breakout_confirmed = bool(last_close > highs.max())
+        previous_ma20 = float(ma20.iloc[-2])
+        previous_close = float(close.iloc[-2])
+        if (last_ma20 is not None and all(math.isfinite(v) and v > 0
+                                         for v in (last_close, previous_close, last_ma20, previous_ma20))):
+            pullback_converging = bool(last_close < previous_close and
+                                      last_close / last_ma20 - 1 < previous_close / previous_ma20 - 1)
     quality = _compute_daily_quality(hist, df)
 
     lookback_idx = max(0, len(close) - 61)
@@ -1017,6 +1092,9 @@ def compute_daily_features(hist: pd.DataFrame) -> dict[str, object]:
 
     return {
         "daily_data_points": int(len(close)),
+        "volume_contracting": volume_contracting,
+        "pullback_converging": pullback_converging,
+        "breakout_confirmed": breakout_confirmed,
         "change_60d": None if change_60d is None else round(float(change_60d), 4),
         "ma5": last_ma5,
         "ma20": last_ma20,
@@ -1285,12 +1363,14 @@ def _compute_rsi(close: pd.Series, period: int = 14) -> float | None:
     delta = close.diff()
     gain = delta.clip(lower=0).rolling(period).mean()
     loss = (-delta.clip(upper=0)).rolling(period).mean()
-    rs = gain / loss.replace(0, pd.NA)
-    rsi = 100 - (100 / (1 + rs))
-    value = rsi.iloc[-1]
-    if pd.isna(value):
+    last_gain, last_loss = gain.iloc[-1], loss.iloc[-1]
+    if pd.isna(last_gain) or pd.isna(last_loss):
         return None
-    return float(value)
+    # Retain simple rolling means (not Wilder smoothing). A fully observed
+    # loss-free window is known, including the explicitly neutral flat case.
+    if last_loss == 0:
+        return 100. if last_gain > 0 else 50.
+    return float(100 - 100 / (1 + last_gain / last_loss))
 
 
 def _classify_rsi(value: float | None) -> str:

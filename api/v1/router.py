@@ -24,14 +24,23 @@ from api.v1.endpoints import (
     history,
     intelligence,
     portfolio,
+    research_delivery,
     stocks,
     system_config,
+    free_models,
     usage,
 )
 
 # 创建 v1 版本主路由。
 # /api/v1 前缀在 api.app 挂载，避免新版 FastAPI 误判子路由 "" 为 empty path。
 router = APIRouter()
+router.include_router(free_models.router, prefix="/free-models", tags=["FreeModels"])
+
+router.include_router(
+    research_delivery.router,
+    prefix="/research-delivery",
+    tags=["ResearchDelivery"]
+)
 
 router.include_router(
     auth.router,

@@ -104,7 +104,7 @@ Discord 长报告发送复用现有分片链路：单条 `content` 运行时不�
 | `NOTIFICATION_REPORT_CHANNELS` | advanced | routing | Variable or Secret | - |
 | `NOTIFICATION_ALERT_CHANNELS` | advanced | routing | Variable or Secret | - |
 | `NOTIFICATION_SYSTEM_ERROR_CHANNELS` | advanced | routing | Variable or Secret | - |
-| `NOTIFICATION_DEDUP_TTL_SECONDS` | advanced | noise | Variable or Secret | `0` |
+| `NOTIFICATION_DEDUP_TTL_SECONDS` | advanced | noise | Variable or Secret | `21600` |
 | `NOTIFICATION_COOLDOWN_SECONDS` | advanced | noise | Variable or Secret | `0` |
 | `NOTIFICATION_QUIET_HOURS` | advanced | noise | Variable or Secret | - |
 | `NOTIFICATION_TIMEZONE` | advanced | noise | Variable or Secret | - |
@@ -249,11 +249,11 @@ DecisionSignal 通知摘要字段、敏感信息边界、迁移与回滚说明�
 
 ## 通知降噪机制
 
-P4 新增进程内降噪，只影响静态配置渠道，不影响 `send_to_context()` 的机器人触发会话回执。默认所有配置关闭，未设置时保持旧行为。
+P4 新增进程内降噪，只影响静态配置渠道，不影响 `send_to_context()` 的机器人触发会话回执。`NOTIFICATION_DEDUP_TTL_SECONDS` 默认 `21600`（6 小时，按内容 hash 去重，防重复派发）；其余配置默认关闭，未设置时保持旧行为。
 
 | 配置 key | 默认值 | 说明 |
 | --- | --- | --- |
-| `NOTIFICATION_DEDUP_TTL_SECONDS` | `0` | 同一稳定去重 key 在 TTL 内只发送一次；`0` 关闭 |
+| `NOTIFICATION_DEDUP_TTL_SECONDS` | `21600` | 同一内容（未显式传 `dedup_key` 时按内容 hash）在 TTL 内只发送一次；`0` 关闭 |
 | `NOTIFICATION_COOLDOWN_SECONDS` | `0` | 同一冷却 key 在窗口内限频；`0` 关闭 |
 | `NOTIFICATION_QUIET_HOURS` | 空 | 静默时段，格式 `HH:MM-HH:MM`，支持跨午夜 |
 | `NOTIFICATION_TIMEZONE` | 空 | 静默时段时区，如 `Asia/Shanghai`；留空使用 Python 运行时本地时区（通常由进程 `TZ` 或系统时区决定） |
@@ -276,6 +276,31 @@ P4 新增进程内降噪，只影响静态配置渠道，不影响 `send_to_cont
 - 同一进程内相同 key 的并发发送会先占用短生命周期 in-flight 槽位，避免突发重复发送；静态渠道全部失败时释放该槽位，不写入正式去重 / 冷却状态。
 - 降噪判断异常时 fail-open：记录日志并继续发送静态渠道。
 - `NOTIFICATION_TIMEZONE` 留空时使用 `datetime.now().astimezone()` 解析到的运行时本地时区；Actions / Docker 场景建议显式配置 `NOTIFICATION_TIMEZONE` 以避免时区歧义。
+
+## 推送内容架构（可读性与合规）
+
+报告与预警推送采用统一的内容架构，目标受众是「没有时间研读全量数据的决策者」，兼顾新手可读性与合规要求。
+
+日报/报告结构（Python 渲染与 Jinja 模板两条路径一致）：
+
+1. **30 秒看懂这份报告**：三条固定引导，说明评分为 0-100 的概率参考、四个价位的用法、以及「看不懂就不做」。
+2. **分析结果摘要**：每只股票一行（信号 + 评分 + 大白话解读 + 趋势预测），按评分降序；「大白话」由 `describe_sentiment_plainly()` 按分档生成，例如 65-79 分输出「偏多——优势在多方，但还没到一边倒」。
+3. **个股详情**：重要信息速览 → 核心结论 → 行情快照 → 数据透视 → 作战计划 → 信号归因 → 多策略综合。
+4. **固定页脚**：数据截至时间（ISO 8601 带时区偏移）、分析模型、历史准确率、免责声明。
+
+合规与事实边界：
+
+- 免责声明由 `REPORT_DISCLAIMER_ENABLED` 控制，**默认开启**；关闭后报告、简报、预警均不再附带声明，面向实盘决策时不建议关闭。
+- 历史准确率在样本不足时显式展示「样本积累中」，不虚构数值；样本足够后由 outcome 评估链路回填。
+- 页脚时间统一为带时区的 ISO 8601（如 `2026-10-16T18:00:00+08:00`），替代此前的 naive 本地时间，避免跨时区场景下无法判断数据时效。
+
+盘中预警为结构化信号卡（`NotificationBuilder.build_signal_alert`）：固定字段位「标的 / 当前值 / 触发条件 / 数据时间 / 数据来源」，规则事实与 AI 解读（`AI 简评`）分区呈现，尾部固定附带新手提示与免责声明；文本降级路径保留 `build_simple_alert`。
+
+## 送达可靠性
+
+- 飞书 Webhook 通道：卡片优先、文本降级，两种 payload 各自享有 3 次指数退避重试预算；网络异常与 HTTP 408/425/429/5xx 会重试并尊重 `Retry-After`（上限 30s），其余 4xx 立即失败走降级，与 App Bot 通道能力对齐。
+- 交互式上下文推送失败时**降级到已配置的静态渠道**（此前为整体放弃，导致会话过期 / Stream 断开时用户完全收不到结果）；dispatch 结果中保留 `__context__` 失败记录便于诊断。
+- 路由配置命中为空、或没有任何可用渠道时，不会静默吞掉消息：返回 `no_channel` / `all_failed` 诊断供上层处理。
 
 ## WebPush / Apprise 评估
 

@@ -425,6 +425,7 @@ class LongbridgeFetcher(BaseFetcher):
     """
 
     name = "LongbridgeFetcher"
+    price_adjustment = "qfq"  # 前复权日线（fqt=1 / adjustflag=2 / auto_adjust 等，详见各自实现）
     priority = int(os.getenv("LONGBRIDGE_PRIORITY", "5"))
 
     _CONNECTION_ERRORS = ("client is closed", "context closed", "connection closed")

@@ -149,7 +149,7 @@ class SearchServiceConcurrencyTestCase(unittest.TestCase):
                 results=[
                     SearchResult(
                         title="fresh-news",
-                        snippet="snippet",
+                        snippet="贵州茅台600519发布季度业绩公告",
                         url="https://example.com/fresh-news",
                         source="example.com",
                         published_date=datetime.now().date().isoformat(),
@@ -352,7 +352,7 @@ class SearchServiceConcurrencyTestCase(unittest.TestCase):
 
         def wait_for_owner(_key, _event, *, timeout_seconds):
             self.assertGreater(timeout_seconds, 0)
-            self.assertLessEqual(timeout_seconds, 0.2)
+            self.assertLessEqual(timeout_seconds, 0.2 + 1e-8)  # monotonic float subtraction tolerance
             time.sleep(0.03)
             return None
 

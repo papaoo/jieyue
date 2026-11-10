@@ -87,7 +87,7 @@ class ScreeningHistoryTestCase(unittest.TestCase):
                     {"code": "event", "text": "事件：Current evidence", "source": "provider", "quality": "observed"},
                 ])
                 self.assertEqual(response["dsa_enrichment"]["enriched_count"], 1)
-                self.assertEqual(response["dsa_enrichment"]["warnings"], [])
+                self.assertTrue(any('fundamental_data_incomplete' in w for w in response["dsa_enrichment"]["warnings"]))
                 history = service.history_detail(response["run_id"])
                 self.assertEqual(history["result"]["candidates"][0], selected)
 
@@ -350,10 +350,13 @@ class ScreeningHistoryTestCase(unittest.TestCase):
                 ):
                     response = service.screen(strategy="dual_low", market="cn", max_results=1)
                 candidate = response["candidates"][0]
-                self.assertEqual(candidate["explanation_quality"]["why_selected"], "partial")
+                self.assertEqual(candidate["explanation_quality"]["why_selected"], "ok" if score is None else "partial")
                 self.assertEqual(candidate["risk_summary"], "风险只保留在风险区")
-                self.assertIn({"code": "llm_ranking", "text": "模型已参与排序（未提供入选理由）",
-                               "source": "llm", "quality": "inferred"}, candidate["why_selected"])
+                if score is None:
+                    self.assertFalse(any(item['source'] == 'llm' for item in candidate['why_selected']))
+                else:
+                    self.assertIn({"code": "llm_ranking", "text": "模型已参与排序（未提供入选理由）",
+                                   "source": "llm", "quality": "inferred"}, candidate["why_selected"])
                 self.assertEqual(service.history_detail(run_id)["result"]["candidates"], [candidate])
 
     def test_empty_pipeline_runs_preserve_actual_strategy_weights_in_history(self) -> None:

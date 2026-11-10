@@ -27,6 +27,15 @@ vi.mock('../../theme/ThemeToggle', () => ({
 }));
 
 describe('SidebarNav', () => {
+  it('keeps an accessible logout name when the navigation is collapsed', () => {
+    render(<MemoryRouter><SidebarNav collapsed /></MemoryRouter>);
+    expect(screen.getByRole('button', { name: '退出' })).toBeInTheDocument();
+  });
+
+  it('exposes the research workspace as a real route', () => {
+    render(<MemoryRouter initialEntries={['/research']}><SidebarNav /></MemoryRouter>);
+    expect(screen.getByRole('link', { name: '跨资产研究' })).toHaveAttribute('aria-current', 'page');
+  });
   it('keeps screening directly after chat without requiring configuration', () => {
     render(<MemoryRouter initialEntries={['/']}><SidebarNav /></MemoryRouter>);
 
@@ -143,5 +152,14 @@ describe('SidebarNav', () => {
     expect(await screen.findByRole('heading', { name: '退出登录' })).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '确认退出' }));
     expect(mockLogout).toHaveBeenCalled();
+  });
+
+  it('warns that all unsaved research drafts are lost on logout', async () => {
+    mockLogout.mockClear();
+    render(<MemoryRouter initialEntries={['/research']}><SidebarNav /></MemoryRouter>);
+    fireEvent.click(screen.getByRole('button', { name: '退出' }));
+    expect(await screen.findByText(/退出会丢弃所有资产未保存的研究草稿/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '取消' }));
+    expect(mockLogout).not.toHaveBeenCalled();
   });
 });

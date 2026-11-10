@@ -74,6 +74,7 @@ class YfinanceFetcher(BaseFetcher):
     """
 
     name = "YfinanceFetcher"
+    price_adjustment = "qfq"  # 前复权日线（fqt=1 / adjustflag=2 / auto_adjust 等，详见各自实现）
     priority = int(os.getenv("YFINANCE_PRIORITY", "4"))
 
     def __init__(self):

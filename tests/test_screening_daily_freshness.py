@@ -32,6 +32,8 @@ def _freeze_time(monkeypatch, value):
 
 @contextmanager
 def _timezone(name):
+    if not hasattr(time, "tzset"):
+        pytest.skip("Cross-host timezone migration requires POSIX time.tzset; native Windows has no equivalent")
     previous = os.environ.get("TZ")
     try:
         os.environ["TZ"] = name
@@ -49,10 +51,12 @@ def _history(last_date, code="000001"):
     market = trading_calendar.get_market_for_stock(code)
     calendar = trading_calendar.xcals.get_calendar(trading_calendar.MARKET_EXCHANGE[market])
     dates = calendar.sessions[calendar.sessions <= pd.Timestamp(last_date)][-65:]
-    return pd.DataFrame({
+    frame = pd.DataFrame({
         "date": dates.strftime("%Y-%m-%d"),
         "open": 10.0, "high": 11.0, "low": 9.0, "close": 10.0, "volume": 1000.0,
     })
+    frame.attrs["price_adjustment"] = "forward"
+    return frame
 
 
 def _cache(tmp_path, hist, acquired_at, code="000001", source="tencent"):

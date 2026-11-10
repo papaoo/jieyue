@@ -26,6 +26,7 @@ _FINNHUB_BASE_URL = "https://finnhub.io/api/v1"
 
 class FinnhubFetcher(BaseFetcher):
     name = "FinnhubFetcher"
+    price_adjustment = "none"  # 日线为原始未复权价
     priority = 2
 
     def __init__(self):

@@ -19,6 +19,7 @@ from api.app import create_app
 from src.config import Config
 from src.services.stock_profile_service import InvalidStockProfileCode, StockProfileService
 from src.storage import DatabaseManager
+from api.v1.schemas.stocks import StockProfileHistoryBlock
 
 
 def test_stock_profile_service_import_is_independent_of_api_bootstrap() -> None:
@@ -147,7 +148,8 @@ def test_profile_uses_one_canonical_code_and_returns_structured_research() -> No
     assert payload["canonical_code"] == "AAPL"
     assert payload["market"] == "us"
     assert payload["quote"]["status"] == "fresh"
-    assert payload["history"]["status"] == "fresh"
+    assert payload["history"]["status"] == "partial"
+    assert "history-freshness-not-verified" in payload["history"]["limitations"]
     assert payload["research"]["status"] == "fresh"
     assert payload["research"]["data"]["structured_report"]["artifact_id"] == "report:12"
     assert payload["portfolio"]["data"] == {"held": True, "matched_markets": ["us"]}
@@ -174,6 +176,86 @@ def test_profile_uses_one_canonical_code_and_returns_structured_research() -> No
     }
     assert dependencies["intelligence_service"].list_items.call_count == 4
     assert dependencies["alert_service"].list_rules.call_count == 2
+
+
+@pytest.mark.parametrize("upstream_status", ["available", "partial"])
+def test_profile_history_preserves_metadata_without_claiming_unverified_freshness(upstream_status: str) -> None:
+    service, dependencies = _service()
+    source_result = {
+        **_history(), "status": upstream_status, "source": "TencentFetcher",
+        "fetched_at": "2026-10-09T14:37:43+00:00", "adjustment": None,
+        "warnings": ["daily-not-realtime", "adjustment-unknown", "freshness-not-verified", "missing-amount"],
+    }
+    dependencies["stock_service"].get_history_data.return_value = source_result
+
+    block = service.get_profile("AAPL")["history"]
+
+    assert block["status"] == "partial"
+    assert block["source"] == source_result["source"]
+    assert block["fetched_at"] == source_result["fetched_at"]
+    assert block["adjustment"] is None
+    assert block["data"] == source_result["data"]
+    assert set(source_result["warnings"]) <= set(block["limitations"])
+    StockProfileHistoryBlock.model_validate(block)
+
+
+def test_profile_history_partial_cannot_be_upgraded_to_fresh_without_warnings() -> None:
+    service, dependencies = _service()
+    dependencies["stock_service"].get_history_data.return_value = {
+        **_history(), "status": "partial", "source": "sample",
+        "fetched_at": "2026-10-09T00:00:00+00:00", "adjustment": None, "warnings": [],
+    }
+
+    assert service.get_profile("AAPL")["history"]["status"] == "partial"
+
+
+@pytest.mark.parametrize("upstream_status", ["empty", "unavailable"])
+def test_profile_history_empty_or_unavailable_keeps_upstream_limitations(upstream_status: str) -> None:
+    service, dependencies = _service()
+    dependencies["stock_service"].get_history_data.return_value = {
+        "data": [], "status": upstream_status, "source": "sample",
+        "fetched_at": "2026-10-09T00:00:00+00:00", "adjustment": None,
+        "warnings": ["freshness-not-verified", "source-unavailable"],
+    }
+
+    block = service.get_profile("AAPL")["history"]
+
+    assert block["status"] == "unavailable"
+    assert block["data"] == []
+    assert block["source"] == "sample"
+    assert {"history_unavailable", "freshness-not-verified", "source-unavailable"} <= set(block["limitations"])
+
+
+def test_profile_history_schema_remains_compatible_with_legacy_blocks() -> None:
+    block = StockProfileHistoryBlock.model_validate({"status": "partial", "data": _history()["data"]})
+    assert block.source is None
+    assert block.fetched_at is None
+    assert block.adjustment is None
+
+
+def test_profile_history_quality_reaches_real_profile_http_json() -> None:
+    from fastapi import FastAPI
+    from api.v1.endpoints.stocks import router
+
+    service, dependencies = _service()
+    dependencies["stock_service"].get_history_data.return_value = {
+        **_history(), "status": "partial", "source": "TencentFetcher",
+        "fetched_at": "2026-10-09T14:37:43+00:00", "adjustment": None,
+        "warnings": ["freshness-not-verified", "optional-fields-missing:amount"],
+    }
+    app = FastAPI()
+    app.include_router(router, prefix="/api/v1/stocks")
+    with patch("api.v1.endpoints.stocks.StockProfileService", return_value=service):
+        with TestClient(app) as client:
+            response = client.get("/api/v1/stocks/AAPL/profile")
+
+    assert response.status_code == 200, response.text
+    block = response.json()["history"]
+    assert block["status"] == "partial"
+    assert block["source"] == "TencentFetcher"
+    assert block["fetched_at"] == "2026-10-09T14:37:43+00:00"
+    assert block["adjustment"] is None
+    assert "optional-fields-missing:amount" in block["limitations"]
 
 
 def test_profile_alias_queries_are_unique_by_casefolded_identity() -> None:

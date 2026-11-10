@@ -20,6 +20,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import List, Dict, Any, Optional, Tuple, TYPE_CHECKING
 from enum import Enum
 
@@ -40,6 +41,7 @@ from src.notification_noise import (
 from src.report_language import (
     get_localized_stock_name,
     get_report_labels,
+    market_snapshot_presentation,
     get_signal_level,
     get_chip_unavailable_reason,
     is_chip_structure_unavailable,
@@ -54,6 +56,11 @@ from src.report_language import (
     normalize_report_language,
     normalize_strategy_synthesis_payload,
     strategy_invalid_opinion_count,
+    describe_sentiment_plainly,
+    newcomer_guide_lines,
+    report_disclaimer_line,
+    report_data_as_of_line,
+    report_accuracy_line,
 )
 from src.schemas.decision_action import (
     display_action_fields_for_result,
@@ -1317,6 +1324,14 @@ class NotificationService(
         ]
         self._append_market_status_line(report_lines, results, report_language)
 
+        # === 新手指南：30 秒看懂这份报告 ===
+        report_lines.extend([
+            f"## 🙋 {labels['newcomer_guide_heading']}",
+            "",
+        ])
+        report_lines.extend(newcomer_guide_lines(report_language))
+        report_lines.append("")
+
         # === 新增：分析结果摘要 (Issue #112) ===
         if results:
             report_lines.extend([
@@ -1326,10 +1341,12 @@ class NotificationService(
             for r in sorted_results:
                 signal_text, signal_emoji, _ = self._get_signal_level(r)
                 display_name = self._get_display_name(r, report_language)
+                plainly = describe_sentiment_plainly(r.sentiment_score, report_language)
+                plainly_suffix = f" | {labels['score_plainly_label']}：{plainly}" if plainly else ""
                 report_lines.append(
                     f"{signal_emoji} **{display_name}({r.code})**: "
                     f"{signal_text} | "
-                    f"{labels['score_label']} {r.sentiment_score} | "
+                    f"{labels['score_label']} {r.sentiment_score}{plainly_suffix} | "
                     f"{localize_trend_prediction(r.trend_prediction, report_language)}"
                 )
                 if self._report_summary_only:
@@ -1487,6 +1504,8 @@ class NotificationService(
                                 "",
                             ])
 
+                if data_persp.get('chip_source_note'):
+                    report_lines.extend([str(data_persp['chip_source_note']), ""])
                 self._append_phase_decision_block(report_lines, dashboard, labels)
 
                 # ========== 作战计划 ==========
@@ -1610,14 +1629,22 @@ class NotificationService(
                     "",
                 ])
 
-        # 底部（去除免责声明）
-        report_lines.extend([
+        # 底部信息：数据时效（带时区）+ 模型 + 历史准确率 + 免责声明（可配置）
+        disclaimer_enabled = getattr(config, 'report_disclaimer_enabled', True)
+        footer_lines = [
             "",
-            f"*{labels['generated_at_label']}：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*",
-        ])
+            f"*{report_data_as_of_line(report_language)}*",
+        ]
         models = self._collect_models_used(results)
         if models:
-            report_lines.append(f"*{labels['analysis_model_label']}：{', '.join(models)}*")
+            footer_lines.append(f"*{labels['analysis_model_label']}：{', '.join(models)}*")
+        footer_lines.append(f"*{report_accuracy_line(report_language)}*")
+        if disclaimer_enabled:
+            footer_lines.extend([
+                "",
+                f"*{report_disclaimer_line(report_language)}*",
+            ])
+        report_lines.extend(footer_lines)
 
         return "\n".join(report_lines)
 
@@ -2147,10 +2174,14 @@ class NotificationService(
         report_language = self._get_report_language(result)
         labels = get_report_labels(report_language)
 
+        presentation = market_snapshot_presentation(snapshot, report_language)
+        heading, price_label, evidence = (presentation[key] for key in ('heading', 'price_label', 'evidence'))
         lines.extend([
-            f"### 📈 {labels['market_snapshot_heading']}",
+            f"### 📈 {heading}",
             "",
-            f"| {labels['close_label']} | {labels['prev_close_label']} | {labels['open_label']} | {labels['high_label']} | {labels['low_label']} | {labels['change_pct_label']} | {labels['change_amount_label']} | {labels['amplitude_label']} | {labels['volume_label']} | {labels['amount_label']} |",
+            f"> {evidence}",
+            "",
+            f"| {price_label} | {labels['prev_close_label']} | {labels['open_label']} | {labels['high_label']} | {labels['low_label']} | {labels['change_pct_label']} | {labels['change_amount_label']} | {labels['amplitude_label']} | {labels['volume_label']} | {labels['amount_label']} |",
             "|------|------|------|------|------|-------|-------|------|--------|--------|",
             f"| {snapshot.get('close', 'N/A')} | {snapshot.get('prev_close', 'N/A')} | "
             f"{snapshot.get('open', 'N/A')} | {snapshot.get('high', 'N/A')} | "
@@ -2371,7 +2402,7 @@ class NotificationService(
             "ttm_cash": self._format_per_share(dividend.get("ttm_cash_dividend_per_share"), dividend_currency),
             "ttm_count": str(ttm_event_count) if isinstance(ttm_event_count, int) else "N/A",
             "ttm_yield": self._format_percent(dividend.get("ttm_dividend_yield_pct")),
-            "latest_ex": self._format_text(latest_event.get("ex_dividend_date") or latest_event.get("event_date")),
+            "latest_ex": self._format_text(dividend.get('latest_implemented_ex_date') or latest_event.get("ex_dividend_date") or latest_event.get("event_date")),
         }
         if all(v == "N/A" for v in cells.values()):
             return
@@ -2390,6 +2421,15 @@ class NotificationService(
             ),
             "",
         ])
+        if dividend.get('events_source') == 'tushare:dividend':
+            # Keep the existing labels/layout, but do not imply provider dv_ttm
+            # was recomputed from a differently-windowed cash-event total.
+            lines.extend([
+                '> Data basis: cash = implemented 365-day events (CNY/share, pre-tax), '
+                f"as of {dividend.get('as_of_events', 'N/A')}; yield = Tushare dv_ttm (%), "
+                f"daily close {dividend.get('as_of', 'N/A')}. Different definitions; do not recompute one from the other.",
+                '',
+            ])
 
     @classmethod
     def _format_net_shares(cls, value: Any) -> str:
@@ -2478,6 +2518,13 @@ class NotificationService(
         add_signals(sector_signals, blocks.get("sector_bottom"), labels["lagging_board_label"])
         add_signals(concept_signals, blocks.get("concept_top"), labels["leading_board_label"])
         add_signals(concept_signals, blocks.get("concept_bottom"), labels["lagging_board_label"])
+        concept_evidence = {}
+        for row in (blocks.get("concept_top") or []) + (blocks.get("concept_bottom") or []):
+            if isinstance(row, dict):
+                concept_evidence.setdefault(str(row.get("name") or "").strip(), row)
+        concept_notes = []
+        today_cn = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+        is_zh = labels["leading_board_label"] == "领涨"
 
         def resolve_board_type(name: str, board_type: str) -> str:
             normalized_type = board_type.strip().lower()
@@ -2532,6 +2579,24 @@ class NotificationService(
             board_type = self._format_text(raw.get("type"))
             board_group = resolve_board_type(name, board_type)
             status_text, change_pct = resolve_signal(name, board_group)
+            if board_group == "concept" and name in concept_evidence:
+                evidence = concept_evidence[name]
+                source = str(evidence.get("source") or "unknown")
+                as_of = str(evidence.get("as_of") or ("未知" if is_zh else "unknown"))
+                same_definition = source != "unknown" and source == raw.get("source")
+                current = as_of == today_cn and same_definition
+                if not current:
+                    status_text, change_pct = None, None
+                pct = _safe_float(evidence.get("change_pct"))
+                value = f"{pct:+.2f}%" if pct is not None else "N/A"
+                scope = "同口径当日快照" if current else "同名概念快照，仅作背景，非当前个股板块信号"
+                if not is_zh:
+                    scope = "same-provider dated snapshot" if current else "same-name snapshot, background only, not a current stock signal"
+                concept_notes.append(
+                    f"> {name}: {value}; source={source}; as_of={as_of}; "
+                    f"fetched_at={evidence.get('updated_at') or 'unknown'}; {scope}; "
+                    f"{evidence.get('definition') or ('成分口径未核验' if is_zh else 'membership definition unverified')}"
+                )
             prepared.append((name, board_type_label(board_group), status_text, change_pct))
 
         if not prepared:
@@ -2550,6 +2615,9 @@ class NotificationService(
         else:
             lines.append(" / ".join(name for name, _, _, _ in prepared))
         lines.append("")
+        if concept_notes:
+            lines.extend(concept_notes)
+            lines.append("")
 
     def _should_use_image_for_channel(
         self, channel: NotificationChannel, image_bytes: Optional[bytes]
@@ -2678,6 +2746,7 @@ class NotificationService(
             Structured dispatch diagnostics.
         """
         context_success = self.send_to_context(content)
+        has_context_channel = self._has_context_channel()
         if not self.should_broadcast_static_channels():
             if context_success:
                 logger.info("已通过上下文会话完成推送，跳过静态通知渠道")
@@ -2687,21 +2756,9 @@ class NotificationService(
                     status="sent",
                     channel_results=[ChannelAttemptResult(channel="__context__", success=True)],
                 )
-            logger.warning("交互式上下文推送失败，已跳过静态通知渠道")
-            return NotificationDispatchResult(
-                dispatched=True,
-                success=False,
-                status="all_failed",
-                channel_results=[
-                    ChannelAttemptResult(
-                        channel="__context__",
-                        success=False,
-                        error_code="send_failed",
-                        retryable=True,
-                    )
-                ],
-                message="interactive context delivery failed; static channels skipped",
-            )
+            # 上下文推送失败时不再整体放弃：降级到已配置的静态渠道重试送达，
+            # 避免会话过期 / Stream 断开等单点故障导致用户完全收不到结果。
+            logger.warning("交互式上下文推送失败，将降级到静态通知渠道重试送达")
 
         if not self._available_channels:
             if context_success:
@@ -2711,6 +2768,22 @@ class NotificationService(
                     success=True,
                     status="sent",
                     channel_results=[ChannelAttemptResult(channel="__context__", success=True)],
+                )
+            if has_context_channel:
+                logger.warning("交互式上下文推送失败，且无其他通知渠道可用")
+                return NotificationDispatchResult(
+                    dispatched=True,
+                    success=False,
+                    status="all_failed",
+                    channel_results=[
+                        ChannelAttemptResult(
+                            channel="__context__",
+                            success=False,
+                            error_code="send_failed",
+                            retryable=True,
+                        )
+                    ],
+                    message="interactive context delivery failed; no static channel available",
                 )
             logger.warning("通知服务不可用，跳过推送")
             return NotificationDispatchResult(
@@ -2853,6 +2926,14 @@ class NotificationService(
             status = "all_failed"
         if context_success:
             channel_results.insert(0, ChannelAttemptResult(channel="__context__", success=True))
+        elif has_context_channel:
+            # 上下文渠道存在但推送失败：保留失败记录，便于诊断与告警识别
+            channel_results.insert(0, ChannelAttemptResult(
+                channel="__context__",
+                success=False,
+                error_code="send_failed",
+                retryable=True,
+            ))
         return NotificationDispatchResult(
             dispatched=True,
             success=success,
@@ -2978,6 +3059,88 @@ class NotificationBuilder:
         emoji = emoji_map.get(alert_type, "📢")
 
         return f"{emoji} **{title}**\n\n{content}"
+
+    @staticmethod
+    def _fmt_alert_number(value: Any) -> str:
+        """Format an alert metric without noisy trailing zeros."""
+        if value is None:
+            return ""
+        if isinstance(value, bool):
+            return str(value)
+        if isinstance(value, (int, float)):
+            text = f"{float(value):.4f}".rstrip("0").rstrip(".")
+            return text or "0"
+        return str(value).strip()
+
+    @staticmethod
+    def build_signal_alert(
+        *,
+        title: str,
+        reason: str,
+        target: Optional[str] = None,
+        observed_value: Optional[Any] = None,
+        threshold: Optional[Any] = None,
+        data_timestamp: Optional[Any] = None,
+        data_source: Optional[str] = None,
+        ai_summary: Optional[str] = None,
+        alert_type: str = "warning",
+        report_language: str = "zh",
+    ) -> str:
+        """构建结构化盘中预警信号卡（Markdown，可被飞书卡片包裹渲染）。
+
+        设计目标：
+        - 固定字段位（标的/当前值/触发条件/数据时间），扫读效率优先；
+        - 区分「规则算出的事实」与「AI 生成的解读」，后者带醒目前缀；
+        - 附带新手提示与免责声明，避免预警被当作确定性结论。
+        """
+        emoji_map = {
+            "info": "ℹ️",
+            "warning": "⚠️",
+            "error": "❌",
+            "success": "✅",
+        }
+        emoji = emoji_map.get(alert_type, "📢")
+        labels = get_report_labels(report_language)
+        config = get_config()
+
+        header_target = f"｜{target}" if target else ""
+        lines = [f"{emoji} **{labels['alert_signal_heading']}{header_target}**", ""]
+
+        fact_parts = []
+        observed_text = NotificationBuilder._fmt_alert_number(observed_value)
+        if observed_text:
+            fact_parts.append(f"**{labels['alert_observed_label']}** {observed_text}")
+        threshold_text = NotificationBuilder._fmt_alert_number(threshold)
+        if threshold_text:
+            fact_parts.append(f"**{labels['alert_threshold_label']}** {threshold_text}")
+        if fact_parts:
+            lines.append("　".join(fact_parts))
+
+        meta_parts = []
+        if data_timestamp:
+            stamp = str(data_timestamp)
+            meta_parts.append(f"**{labels['alert_data_as_of_label']}** {stamp}")
+        if data_source:
+            meta_parts.append(f"**{labels['data_sources_label']}** {data_source}")
+        if meta_parts:
+            lines.append("　".join(meta_parts))
+
+        if reason:
+            lines.extend(["", f"**{labels['alert_rule_label']}**：{reason}"])
+        if ai_summary:
+            lines.extend(["", f"🧠 **{labels['alert_ai_label']}**：{ai_summary}"])
+
+        lines.extend([
+            "",
+            "---",
+            "",
+            f"💡 {labels['alert_newcomer_hint']}",
+        ])
+        if getattr(config, "report_disclaimer_enabled", True):
+            # disclaimer_line 已自带 ⚠️ 前缀，避免重复
+            lines.append(labels["disclaimer_line"])
+
+        return "\n".join(lines)
 
     @staticmethod
     def build_stock_summary(results: List[AnalysisResult]) -> str:

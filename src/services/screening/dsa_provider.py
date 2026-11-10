@@ -46,6 +46,11 @@ def apply_dsa_provider_context(
             if not normalized:
                 continue
             pick.dsa_context = normalized["context"]
+            fundamentals = pick.dsa_context.get("fundamentals") or {}
+            board_data = (fundamentals.get("boards") or {}).get("data") or {}
+            if not pick.industry and board_data.get("industry"):
+                pick.industry = str(board_data["industry"])
+                pick.raw["industry"] = pick.industry
             pick.dsa_news = normalized["news"]
             pick.dsa_analysis_summary = normalized["summary"]
             if _is_enriched_context(pick.dsa_context, pick.dsa_news):

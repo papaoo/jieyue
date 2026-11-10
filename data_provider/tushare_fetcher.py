@@ -18,6 +18,7 @@ import json as _json
 import logging
 import re
 import time
+from threading import Lock
 from datetime import datetime, timedelta
 from typing import Optional, Tuple, List, Dict, Any
 
@@ -102,14 +103,15 @@ class _TushareHttpClient:
         self._timeout = timeout
         self._api_url = api_url
 
-    def query(self, api_name: str, fields: str = "", **kwargs) -> pd.DataFrame:
+    def query(self, api_name: str, fields: str = "", *, request_timeout: Optional[float] = None, **kwargs) -> pd.DataFrame:
         req_params = {
             "api_name": api_name,
             "token": self._token,
             "params": kwargs,
             "fields": fields,
         }
-        res = requests.post(self._api_url, json=req_params, timeout=self._timeout)
+        timeout = self._timeout if request_timeout is None else min(self._timeout, max(0.1, request_timeout))
+        res = requests.post(self._api_url, json=req_params, timeout=timeout)
         if res.status_code != 200:
             raise Exception(f"Tushare API HTTP {res.status_code}")
 
@@ -132,6 +134,18 @@ class _TushareHttpClient:
         return caller
 
 
+def create_tushare_http_client(token: str, *, timeout: int = 30, api_url: Optional[str] = None) -> _TushareHttpClient:
+    """Use the unified POST protocol, independently of installed SDK versions."""
+    api_url = api_url.strip() if api_url is not None else (
+        os.getenv("TUSHARE_API_URL", "").strip()
+        or _resolve_tushare_http_url()
+        or "http://api.tushare.pro"
+    )
+    if not api_url.startswith(("http://", "https://")):
+        raise ValueError("Tushare API URL must start with http:// or https://")
+    return _TushareHttpClient(token=token, timeout=timeout, api_url=api_url)
+
+
 class TushareFetcher(BaseFetcher):
     """
     Tushare Pro 数据源实现
@@ -151,6 +165,10 @@ class TushareFetcher(BaseFetcher):
     
     name = "TushareFetcher"
     priority = int(os.getenv("TUSHARE_PRIORITY", "2"))  # 默认优先级，会在 __init__ 中根据配置动态调整
+    # 日线统一返回前复权价：A 股/ETF 用 adj_factor/fund_adj 自算，港股用 hk_daily_adj。
+    # 修复前 daily()/fund_daily()/hk_daily 均返回不复权价，且配 Token 后优先级最高，
+    # 导致默认路径拿到不复权序列、与 fallback 源的前复权基准混用。
+    price_adjustment = "qfq"
 
     def __init__(self, rate_limit_per_minute: int = 80):
         """
@@ -163,6 +181,11 @@ class TushareFetcher(BaseFetcher):
         self._call_count = 0  # 当前分钟内的调用次数
         self._minute_start: Optional[float] = None  # 当前计数周期开始时间
         self._api: Optional[object] = None  # Tushare API 实例
+        self._fundamental_market_cache = {}
+        self._fundamental_market_lock = Lock()
+        # 复权因子缓存：同一 (接口, 标的, 窗口) 短 TTL 内复用，避免翻倍消耗配额
+        self._adj_factor_cache: Dict[tuple, tuple] = {}
+        self._adj_factor_lock = Lock()
         self.date_list: Optional[List[str]] = None  # 交易日列表缓存（倒序，最新日期在前）
         self._date_list_end: Optional[str] = None  # 缓存对应的截止日期，用于跨日刷新
 
@@ -469,56 +492,65 @@ class TushareFetcher(BaseFetcher):
     )
     def _fetch_raw_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
         """
-        从 Tushare 获取原始数据
-        
+        从 Tushare 获取原始数据（统一返回前复权日线）
+
         根据代码类型选择不同接口：
-        - 普通股票：daily()
-        - ETF 基金：fund_daily()
-        
+        - 港股：hk_daily_adj（本身即前复权价）
+        - ETF 基金：fund_daily + fund_adj 复权因子自算前复权
+        - 普通 A 股：daily + adj_factor 复权因子自算前复权
+
+        复权口径说明（修复历史问题）：
+        daily()/fund_daily()/hk_daily 返回的是**不复权**价，而本数据源配 Token 后
+        优先级最高（-1），默认路径长期拿到不复权序列；一旦配额耗尽切到
+        efinance/akshare（前复权），同一股票前后两段基准不同，除权日跳空直接扭曲
+        MA/量比，且落库后无法检测。现在统一换算为前复权，与链上其他 qfq 源同口径。
+
         流程：
         1. 检查 API 是否可用
         2. 检查是否为美股（不支持）
         3. 执行速率限制检查
         4. 转换股票代码格式
-        5. 根据代码类型选择接口并调用
+        5. 根据代码类型选择接口并调用，必要时叠加复权因子换算
         """
         if self._api is None:
             raise DataFetchError("Tushare API 未初始化，请检查 Token 配置")
-        
+
         # US stocks not supported
         if _is_us_code(stock_code):
             raise DataFetchError(f"TushareFetcher 不支持美股 {stock_code}，请使用 AkshareFetcher 或 YfinanceFetcher")
-        
+
         # Rate-limit check
         self._check_rate_limit()
-        
+
         is_hk = _is_hk_market(stock_code)
          # 判断是否为 ETF / 港股，以选择不同接口
         is_etf = _is_etf_code(stock_code)
         if is_hk:
             ts_code = self._convert_hk_stock_code_for_tushare(stock_code)
-            api_name = "hk_daily"
         else:
             ts_code = self._convert_stock_code(stock_code)
-            api_name = "fund_daily" if is_etf else "daily"
-        
+
         # Convert date format (Tushare requires YYYYMMDD)
         ts_start = start_date.replace('-', '')
         ts_end = end_date.replace('-', '')
-        
-       
 
-        logger.debug(f"调用 Tushare {api_name}({ts_code}, {ts_start}, {ts_end})")
-        
+        logger.debug(f"调用 Tushare daily({ts_code}, {ts_start}, {ts_end})")
+
         try:
             if is_hk:
-                # 港股使用 hk_daily 接口
-                df = self._api.hk_daily(
+                # 港股复权日线：hk_daily_adj 本身即前复权价。
+                # 失败或为空时直接抛错，让管理器切换到下一个数据源——
+                # 绝不静默回退到不复权的 hk_daily（会重新引入复权基准漂移）。
+                df = self._api.hk_daily_adj(
                     ts_code=ts_code,
                     start_date=ts_start,
                     end_date=ts_end,
                 )
-            elif is_etf:
+                if df is None or df.empty:
+                    raise DataFetchError(f"Tushare hk_daily_adj 无数据: {ts_code}（不回退不复权源）")
+                return df
+
+            if is_etf:
                 # ETF uses fund_daily interface
                 df = self._api.fund_daily(
                     ts_code=ts_code,
@@ -532,18 +564,107 @@ class TushareFetcher(BaseFetcher):
                     start_date=ts_start,
                     end_date=ts_end,
                 )
-            
-            return df
-            
+
+            if df is None or df.empty:
+                return df
+
+            # A 股 / ETF：拉复权因子并自算前复权，保证与 efinance/akshare 等同口径
+            adj_api = "fund_adj" if is_etf else "adj_factor"
+            adj_df = self._fetch_adjustment_factors(adj_api, ts_code, ts_start, ts_end)
+            return self._apply_forward_adjustment(df, adj_df)
+
+        except (DataFetchError, RateLimitError):
+            raise
         except Exception as e:
             error_msg = str(e).lower()
-            
+
             # 检测配额超限
             if any(keyword in error_msg for keyword in ['quota', '配额', 'limit', '权限']):
                 logger.warning(f"Tushare 配额可能超限: {e}")
                 raise RateLimitError(f"Tushare 配额超限: {e}") from e
-            
+
             raise DataFetchError(f"Tushare 获取数据失败: {e}") from e
+
+    # 复权因子缓存 TTL（秒）：同一窗口的因子在当日基本不变，短 TTL 足够防抖动
+    _ADJ_FACTOR_CACHE_TTL_SECONDS = 300
+    _ADJ_FACTOR_CACHE_MAX_ENTRIES = 64
+
+    def _fetch_adjustment_factors(self, api_name: str, ts_code: str, ts_start: str, ts_end: str) -> pd.DataFrame:
+        """获取复权因子（adj_factor / fund_adj），带短 TTL 进程内缓存。
+
+        缓存避免同一标的的重复分析窗口翻倍消耗 Tushare 配额；失败直接抛
+        DataFetchError，由管理器的 fallback 链选择其他前复权数据源。
+        """
+        cache_key = (api_name, ts_code, ts_start, ts_end)
+        now = time.monotonic()
+        with self._adj_factor_lock:
+            cached = self._adj_factor_cache.get(cache_key)
+            if cached and now - cached[0] < self._ADJ_FACTOR_CACHE_TTL_SECONDS:
+                return cached[1].copy(deep=True)
+
+        try:
+            adj_df = self._api.query(
+                api_name,
+                fields="ts_code,trade_date,adj_factor",
+                ts_code=ts_code,
+                start_date=ts_start,
+                end_date=ts_end,
+            )
+        except Exception as exc:
+            logger.warning("Tushare %s 获取失败(%s): %s", api_name, ts_code, exc)
+            raise DataFetchError(f"Tushare {api_name} 获取失败: {exc}") from exc
+
+        if adj_df is None or adj_df.empty or "adj_factor" not in adj_df.columns:
+            raise DataFetchError(f"Tushare {api_name} 无复权因子数据: {ts_code}")
+
+        with self._adj_factor_lock:
+            if len(self._adj_factor_cache) >= self._ADJ_FACTOR_CACHE_MAX_ENTRIES:
+                self._adj_factor_cache.pop(next(iter(self._adj_factor_cache)))
+            self._adj_factor_cache[cache_key] = (now, adj_df.copy(deep=True))
+        return adj_df
+
+    @staticmethod
+    def _apply_forward_adjustment(df: pd.DataFrame, adj_df: pd.DataFrame) -> pd.DataFrame:
+        """按复权因子把原始 OHLC 换算为前复权价（锚定窗口内最新交易日）。
+
+        - 价格列 open/high/low/close/pre_close 统一乘以 factor / latest_factor
+        - change / pct_chg 由复权后价格重算，保证与复权序列自洽
+          （除权日原始 pct_chg 与复权序列不一致，必须重算）
+        - 复权因子缺失的交易日直接丢弃；因子为空或无交集时抛错，
+          由管理器切换到其他前复权数据源，绝不返回不复权序列
+        """
+        out = df.copy()
+        adj = adj_df[["trade_date", "adj_factor"]].copy()
+        adj["trade_date"] = adj["trade_date"].astype(str).str.strip()
+        out["trade_date"] = out["trade_date"].astype(str).str.strip()
+
+        adj = adj.dropna(subset=["adj_factor"])
+        adj["adj_factor"] = pd.to_numeric(adj["adj_factor"], errors="coerce")
+        adj = adj.dropna(subset=["adj_factor"])
+        adj = adj.groupby("trade_date", as_index=False)["adj_factor"].last()
+        if adj.empty:
+            raise DataFetchError("复权因子为空，无法计算前复权价格")
+
+        latest_factor = float(adj.sort_values("trade_date")["adj_factor"].iloc[-1])
+        if latest_factor <= 0:
+            raise DataFetchError(f"复权因子异常（latest={latest_factor}），拒绝输出不复权序列")
+
+        out = out.merge(adj, on="trade_date", how="inner")
+        if out.empty:
+            raise DataFetchError("复权因子与行情日期无交集，无法计算前复权价格")
+
+        scale = out["adj_factor"].astype(float) / latest_factor
+        for col in ("open", "high", "low", "close", "pre_close"):
+            if col in out.columns:
+                out[col] = pd.to_numeric(out[col], errors="coerce") * scale
+
+        close = pd.to_numeric(out["close"], errors="coerce")
+        if "change" in out.columns:
+            out["change"] = close.diff()
+        if "pct_chg" in out.columns:
+            out["pct_chg"] = close.pct_change() * 100
+
+        return out.drop(columns=["adj_factor"])
     
     def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
         """
@@ -593,6 +714,54 @@ class TushareFetcher(BaseFetcher):
         df = df[existing_cols]
         
         return df
+
+    def get_fundamental_snapshot(self, stock_code: str, *, budget_seconds: float, on_block=None) -> dict:
+        """Use configured permissions for dated, per-symbol factual blocks."""
+        from .tushare_fundamental_adapter import TushareFundamentalAdapter
+
+        def query(api_name, **kwargs):
+            started = time.monotonic()
+            cacheable = not kwargs.get('ts_code') and api_name in {'stock_basic', 'daily', 'moneyflow', 'trade_cal', 'top_list'}
+            key = (api_name, _json.dumps({k: v for k, v in kwargs.items() if k != 'request_timeout'}, sort_keys=True))
+            # Serialize market-table fills so a shortlist shares requests, not
+            # merely the eventual result. Lock wait is charged to stage budget.
+            locked = False
+            if cacheable:
+                locked = self._fundamental_market_lock.acquire(timeout=max(0, kwargs.get('request_timeout', 5)))
+                if not locked:
+                    raise TimeoutError('market table cache wait exhausted')
+            try:
+                if cacheable:
+                    cached = self._fundamental_market_cache.get(key)
+                    if cached and time.monotonic() - cached[0] < 900:
+                        frame = cached[1].copy(deep=True)
+                        frame.attrs['cache_hit'] = True
+                        return frame
+                remaining = kwargs.get('request_timeout', 5) - (time.monotonic() - started)
+                # The general historical-data limiter may sleep for a minute;
+                # a bounded fundamental stage must fail open before that wait.
+                if (self._minute_start is not None and self._call_count >= self.rate_limit_per_minute
+                        and time.time() - self._minute_start < 60
+                        and 61 - (time.time() - self._minute_start) >= remaining):
+                    raise TimeoutError('fundamental rate limit budget exhausted')
+                self._check_rate_limit()
+                remaining = kwargs.get('request_timeout', 5) - (time.monotonic() - started)
+                if remaining <= 0:
+                    raise TimeoutError('fundamental rate limit budget exhausted')
+                kwargs['request_timeout'] = remaining
+                frame = self._api.query(api_name, **kwargs)
+                if cacheable and isinstance(frame, pd.DataFrame) and not frame.empty:
+                    frame.attrs['data_fetched_at'] = datetime.now().astimezone().isoformat()
+                    frame.attrs['cache_hit'] = False
+                    if len(self._fundamental_market_cache) >= 32:
+                        self._fundamental_market_cache.pop(next(iter(self._fundamental_market_cache)))
+                    self._fundamental_market_cache[key] = (time.monotonic(), frame.copy(deep=True))
+                return frame
+            finally:
+                if locked:
+                    self._fundamental_market_lock.release()
+
+        return TushareFundamentalAdapter(query).fetch(stock_code, budget_seconds=budget_seconds, on_block=on_block)
 
     def get_stock_name(self, stock_code: str) -> Optional[str]:
         """
@@ -794,12 +963,16 @@ class TushareFetcher(BaseFetcher):
                 price=price,
                 change_pct=round(change_pct, 2),
                 change_amount=round(change_amount, 2),
-                volume=safe_int(row['volume']) // 100,  # 转换为手
+                volume=safe_int(row['volume']),  # 新浪旧接口已是股；统一对象也以股计
                 amount=safe_float(row['amount']),
                 high=safe_float(row['high']),
                 low=safe_float(row['low']),
                 open_price=safe_float(row['open']),
                 pre_close=pre_close,
+                provider_timestamp=(
+                    f"{row['date']}T{row['time']}+08:00"
+                    if row.get('date') and row.get('time') else None
+                ),
             )
 
         except Exception as e:
@@ -932,10 +1105,10 @@ class TushareFetcher(BaseFetcher):
                 try:
                     df = self._call_api_with_rate_limit(
                         "daily",
-                        ts_code='3*.SZ,6*.SH,0*.SZ,92*.BJ',
-                        start_date=last_date,
-                        end_date=last_date,
+                        trade_date=last_date,
                     )
+                    if df is None or df.empty:
+                        return None
                     # 为防止不同接口返回的列名大小写不一致（例如 rt_k 返回小写，daily 返回大写），统一将列名转为小写
                     df.columns = [col.lower() for col in df.columns]
 
@@ -947,7 +1120,12 @@ class TushareFetcher(BaseFetcher):
                         df['amount'] = df['amount'] * 1000
 
                     if df is not None and not df.empty:
-                        return self._calc_market_stats(df)
+                        stats = self._calc_market_stats(df)
+                        if stats:
+                            stats.update(as_of=pd.Timestamp(last_date).date().isoformat(),
+                                         source='tushare.daily', kind='end_of_day',
+                                         amount_unit='CNY100m', observed_count=len(df))
+                        return stats
                 except Exception as e:
                     logger.error(f"[Tushare] ts.pro_api().daily 获取数据失败: {e}")
                     
@@ -1126,7 +1304,7 @@ class TushareFetcher(BaseFetcher):
                 if change_col in df.columns:
                     return _get_rank_top_n(df, change_col, name, n)
         except Exception as e:
-            logger.warning(f"[Tushare] 获取同花顺行业板块涨跌榜失败: {e} 尝试东财接口")
+            logger.warning("[Tushare] 同花顺行业榜不可用 (%s)，尝试东财", type(e).__name__)
 
         # 同花顺接口失败，降级尝试东财接口
         logger.info("[Tushare] ts.pro_api().moneyflow_ind_dc 获取板块排行(东财)...")
@@ -1139,11 +1317,40 @@ class TushareFetcher(BaseFetcher):
                 if change_col in df.columns:
                     return _get_rank_top_n(df, change_col, name, n)
         except Exception as e:
-            logger.warning(f"[Tushare] 获取东财行业板块涨跌榜失败: {e}")
-            return None
-        
-        # 获取为空或者接口调用失败，返回 None
-        return None
+            logger.warning("[Tushare] 东财行业榜不可用 (%s)，尝试已授权日线聚合", type(e).__name__)
+
+        return self._get_derived_sector_rankings(start_date, n)
+
+    def _get_derived_sector_rankings(self, trade_date: str, n: int) -> Optional[Tuple[list, list]]:
+        """Explicit equal-weight sector fallback for existing hotspot/agent APIs."""
+        from .tushare_fact_normalizers import industry_facts
+        import copy
+        cached = getattr(self, '_derived_sector_cache', None)
+        if cached and cached[0] == trade_date and time.monotonic() - cached[1] < 900:
+            ranking = copy.deepcopy(cached[2])
+        else:
+            try:
+                members = self._call_api_with_rate_limit('stock_basic', list_status='L', limit=10000,
+                                                         fields='ts_code,industry', request_timeout=3)
+                daily = self._call_api_with_rate_limit('daily', trade_date=trade_date, limit=6000,
+                                                       fields='ts_code,trade_date,pct_chg', request_timeout=3)
+                if (not isinstance(members, pd.DataFrame) or not isinstance(daily, pd.DataFrame)
+                        or members.empty or daily.empty or len(members) >= 10000 or len(daily) >= 6000):
+                    return None
+                ranking, _ = industry_facts(members, daily, pd.DataFrame(), trade_date)
+                if not ranking:
+                    return None
+                self._derived_sector_cache = (trade_date, time.monotonic(), copy.deepcopy(ranking))
+            except Exception as exc:
+                logger.warning('[Tushare] 行业聚合不可用 (%s)', type(exc).__name__)
+                return None
+        rows = ranking['all']
+        # Tuple-based legacy consumers have no envelope; attach scope per row.
+        meta = {key: ranking[key] for key in ('as_of', 'source', 'definition', 'definition_warning',
+                 'coverage_complete', 'membership_is_point_in_time', 'population_basis', 'traded_count', 'mapped_count')}
+        count = max(1, int(n))
+        return ([{**row, **meta} for row in rows[:count]],
+                [{**row, **meta} for row in reversed(rows[-count:])])
     
     
 
@@ -1156,7 +1363,7 @@ class TushareFetcher(BaseFetcher):
         包含：获利比例、平均成本、筹码集中度
         
         注意：ETF/指数没有筹码分布数据，会直接返回 None；港股不支持，直接返回 None。
-        5000积分以下每天访问15次,每小时访问5次
+        cyq_chips 为受权限控制的日终估算数据；具体门槛以官方接口与账号权限为准。
         
         Args:
             stock_code: 股票代码
@@ -1192,6 +1399,17 @@ class TushareFetcher(BaseFetcher):
                 end_date=start_date,
             )
             if df is not None and not df.empty:
+                if 'trade_date' not in df or 'ts_code' not in df:
+                    raise ValueError("chip response has no issuer/date evidence")
+                df = df[df['ts_code'] == ts_code].copy()
+                if df.empty:
+                    return None
+                dates = pd.to_datetime(df['trade_date'], format='%Y%m%d', errors='coerce')
+                df = df[dates.notna() & (dates <= pd.Timestamp(start_date))]
+                if df.empty:
+                    return None
+                start_date = str(df['trade_date'].max())
+                df = df[df['trade_date'] == start_date]
                 daily_df = self._call_api_with_rate_limit(
                     "daily",
                     ts_code=ts_code,
@@ -1205,6 +1423,7 @@ class TushareFetcher(BaseFetcher):
 
                 chip = ChipDistribution(
                     code=stock_code,
+                    source="tushare",
                     date=datetime.strptime(start_date, '%Y%m%d').strftime('%Y-%m-%d'),
                     profit_ratio=metrics['获利比例'],
                     avg_cost=metrics['平均成本'],
@@ -1222,8 +1441,10 @@ class TushareFetcher(BaseFetcher):
                 return chip
 
         except Exception as e:
-            logger.warning(f"[Tushare] 获取筹码分布失败 {stock_code}: {e}")
-            return None
+            logger.warning("[Tushare] 筹码获取失败 %s (%s)", stock_code, type(e).__name__)
+            if any(marker in str(e).lower() for marker in ('权限', '积分', 'permission', 'privilege')):
+                raise PermissionError("Tushare chip endpoint permission unavailable") from None
+            raise
 
     def compute_cyq_metrics(self, df: pd.DataFrame, current_price: float) -> dict:
         """

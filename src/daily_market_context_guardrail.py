@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from copy import deepcopy
 from typing import Any, List
 
 from src.report_language import (
@@ -74,6 +75,12 @@ def apply_daily_market_context_guardrail(
     if not _has_aggressive_buy_signal(result, language=language):
         return []
 
+    original = {
+        key: deepcopy(getattr(result, key, None))
+        for key in ("operation_advice", "decision_type", "sentiment_score",
+                    "confidence_level", "analysis_summary", "buy_reason", "dashboard")
+    }
+
     adjustments: List[str] = []
     if str(getattr(result, "decision_type", "") or "").lower() == "buy":
         result.decision_type = "hold"
@@ -83,6 +90,7 @@ def apply_daily_market_context_guardrail(
 
     softened_advice = _softened_operation_advice(language)
     result.operation_advice = softened_advice
+    result.decision_type = "hold"
 
     if _is_high_confidence(getattr(result, "confidence_level", "")):
         result.confidence_level = localize_confidence_level("medium", language)
@@ -108,8 +116,49 @@ def apply_daily_market_context_guardrail(
         phase_decision = {}
         dashboard["phase_decision"] = phase_decision
     _append_softening_limitation(phase_decision, language=language)
+    _sync_final_narrative(result, dashboard, phase_decision, original, language)
 
     return adjustments
+
+
+def _sync_final_narrative(result, dashboard, phase_decision, original, language) -> None:
+    """Publish one guarded decision, keeping the pre-guardrail text for audit only.
+
+    Do not regex-rewrite technical evidence or conditional arguments: the final
+    decision summary is deterministic, while original prose remains inspectable.
+    """
+    if language == "en":
+        summary = (
+            "Final advice: Watch. The daily market context is conservative/high risk; "
+            "the model's initial buy view was overridden. Do not open or add to a position "
+            "until market risk eases and confirmation is reassessed."
+        )
+    elif language == "ko":
+        summary = (
+            "최종 권고: 관망. 시장 환경이 보수적/고위험이므로 모델의 초기 매수 판단을 조정했습니다. "
+            "시장 위험 완화와 확인 신호를 재평가하기 전에는 신규 진입하거나 비중을 늘리지 마세요."
+        )
+    else:
+        summary = (
+            "最终建议：观望。大盘环境偏谨慎/高风险，模型原始买入判断已被风控调整。"
+            "暂不开新仓、不加仓，等待市场风险缓解并重新核验确认信号。"
+        )
+    result.analysis_summary = summary
+    result.buy_reason = summary
+    dashboard.update(
+        analysis_summary=summary, buy_reason=summary,
+        sentiment_score=result.sentiment_score, confidence_level=result.confidence_level,
+    )
+    phase_decision["immediate_action"] = _softened_position_advice(language)["no_position"]
+    phase_decision["action_window"] = "wait"
+    dashboard["decision_audit"] = {
+        "reason": "daily_market_context_buy_softened",
+        "original": original,
+        "final": {key: getattr(result, key, None) for key in (
+            "operation_advice", "decision_type", "sentiment_score", "confidence_level",
+            "analysis_summary",
+        )},
+    }
 
 
 def _sync_softened_dashboard_fields(

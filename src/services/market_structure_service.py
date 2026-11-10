@@ -203,7 +203,7 @@ class MarketStructureService:
         context = MarketStructureContext(
             status=combined_status,
             market=normalized_market,
-            trade_date=trade_date_text,
+            trade_date=market_theme_context.trade_date,
             market_theme_context=market_theme_context,
             stock_market_position=stock_position,
         )
@@ -405,21 +405,21 @@ class MarketStructureService:
                 ):
                     continue
             phase = self._theme_phase(item.get("phase"))
-            if phase == "unknown":
-                phase = self._phase_from_change(self._safe_float(item.get("change_pct")))
             return PrimaryTheme(
                 name=name,
                 source=source,
                 phase=phase,
                 rank=self._safe_int(item.get("rank")),
                 change_pct=self._safe_float(item.get("change_pct")),
+                as_of=self._optional_text(item.get('as_of')),
+                provider=self._optional_text(item.get('provider')),
             ), True
 
         first = self._select_ranked_related_board(related_boards)
         return PrimaryTheme(
             name=first.name,
             source=first.source,
-            phase=self._phase_from_change(first.change_pct),
+            phase='unknown',
             rank=first.rank,
             change_pct=first.change_pct,
         ), False

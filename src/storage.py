@@ -135,6 +135,11 @@ class StockDaily(Base):
     # 数据来源
     data_source = Column(String(50))  # 记录数据来源（如 AkshareFetcher）
 
+    # 日线复权口径：qfq=前复权 / hfq=后复权 / none=不复权；NULL=未知（存量行）。
+    # fallback 链上不同源的复权基准可能不同，混用会让除权日附近的指标与收益计算失真，
+    # 且无法从价格本身分辨；落库记录后，读取侧可检测同一标的的历史窗口是否混用。
+    price_adjustment = Column(String(16), nullable=True)
+
     # canonical_id：Phase 1 前缀格式的稳定分析目标键（如 sh000300 / sh600519 / AAPL）。
     # Expand-Contract PR2：仅加列 + 双写，读路径仍用 ``code`` 列；PR3/PR4 再切读路径。
     # 可空：存量行由自愈式迁移 backfill；新写由 ``save_daily_data`` 推导或显式传入。
@@ -173,6 +178,7 @@ class StockDaily(Base):
             'ma20': self.ma20,
             'volume_ratio': self.volume_ratio,
             'data_source': self.data_source,
+            'price_adjustment': self.price_adjustment,
             'canonical_id': self.canonical_id,
         }
 
@@ -501,10 +507,22 @@ class BacktestSummary(Base):
     avg_stock_return_pct = Column(Float)
     avg_simulated_return_pct = Column(Float)
 
+    # 风险/质量指标（v2）：胜率之外必须能看到盈亏比、回撤与基准对照
+    benchmark_avg_return_pct = Column(Float)
+    excess_vs_benchmark_pct = Column(Float)
+    profit_factor = Column(Float)
+    max_drawdown_pct = Column(Float)
+    avg_win_return_pct = Column(Float)
+    avg_loss_return_pct = Column(Float)
+    largest_loss_pct = Column(Float)
+    largest_win_pct = Column(Float)
+    drawdown_series_points = Column(Integer)
+
     # 目标价触发统计（仅 long 且配置止盈/止损时统计）
     stop_loss_trigger_rate = Column(Float)
     take_profit_trigger_rate = Column(Float)
     ambiguous_rate = Column(Float)
+    ambiguous_count = Column(Integer)
     avg_days_to_first_hit = Column(Float)
 
     # 诊断字段（JSON 字符串）
@@ -1382,6 +1400,8 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             self._ensure_llm_usage_telemetry_columns()
             self._ensure_decision_signal_profile_schema()
             self._ensure_stock_daily_canonical_id()
+            self._ensure_stock_daily_price_adjustment()
+            self._ensure_backtest_summary_risk_metrics()
             self._ensure_intelligence_item_scope_values()
             self._ensure_schema_migration_record()
             self._ensure_intelligence_items_unique_index()
@@ -1704,6 +1724,162 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 f"expected=['canonical_id'] "
                 f"actual={actual_indexes.get('ix_stock_daily_canonical_id')}"
             )
+
+    @staticmethod
+    def _resolve_price_adjustment(data_source: Optional[str]) -> Optional[str]:
+        """Resolve a data source's price-adjustment mode from the provider registry.
+
+        The registry is populated by ``DataFetcherManager`` when it indexes
+        fetchers, so the mapping lives next to each fetcher implementation
+        instead of being duplicated here. Returns ``None`` when the source is
+        unknown (unknown is not the same as ``none`` = unadjusted).
+        """
+        if not data_source:
+            return None
+        try:
+            from data_provider.base import price_adjustment_for_source
+
+            return price_adjustment_for_source(data_source)
+        except Exception as exc:  # pragma: no cover - defensive (import cycle / partial install)
+            logger.debug("price_adjustment lookup failed for %r: %s", data_source, exc)
+            return None
+
+    def _ensure_stock_daily_price_adjustment(self) -> None:
+        """Self-healing migration: add the nullable ``price_adjustment`` column.
+
+        Mirrors the ``_ensure_stock_daily_canonical_id`` pattern:
+
+        1. SQLite-only (other engines rely on ``Base.metadata.create_all``).
+        2. Skip when the table does not exist yet.
+        3. ``ALTER TABLE ... ADD COLUMN price_adjustment VARCHAR(16)`` once
+           (idempotent; existing rows stay NULL = unknown, which is honest —
+           legacy rows carry no adjustment provenance).
+        """
+        if not self._is_sqlite_engine:
+            return
+        inspector = inspect(self._engine)
+        if not inspector.has_table(StockDaily.__tablename__):
+            return
+
+        existing = {
+            column["name"]
+            for column in inspector.get_columns(StockDaily.__tablename__)
+        }
+        if "price_adjustment" in existing:
+            return
+
+        try:
+            with self._engine.begin() as connection:
+                connection.exec_driver_sql(
+                    f"ALTER TABLE {StockDaily.__tablename__} "
+                    "ADD COLUMN price_adjustment VARCHAR(16)"
+                )
+            logger.info("[StockDaily] added price_adjustment column")
+        except OperationalError as exc:
+            if not self._is_sqlite_duplicate_column_error(exc, "price_adjustment"):
+                raise
+
+    def _ensure_backtest_summary_risk_metrics(self) -> None:
+        """Self-healing migration: add v2 risk/quality columns to summaries.
+
+        Same SQLite-only, idempotent ``ALTER TABLE`` pattern as the other
+        self-healing migrations. Existing rows stay NULL (metrics unknown until
+        the next backtest recompute), which is honest rather than backfilled
+        with zeros that would read like real risk numbers.
+        """
+        if not self._is_sqlite_engine:
+            return
+        inspector = inspect(self._engine)
+        if not inspector.has_table(BacktestSummary.__tablename__):
+            return
+
+        try:
+            existing = {
+                column["name"]
+                for column in inspector.get_columns(BacktestSummary.__tablename__)
+            }
+        except Exception as exc:
+            logger.error(
+                "[BacktestSummary] failed to inspect risk metric columns; "
+                "migration cannot continue safely: %s",
+                exc,
+            )
+            raise
+
+        new_columns = (
+            ("benchmark_avg_return_pct", "FLOAT"),
+            ("excess_vs_benchmark_pct", "FLOAT"),
+            ("profit_factor", "FLOAT"),
+            ("max_drawdown_pct", "FLOAT"),
+            ("avg_win_return_pct", "FLOAT"),
+            ("avg_loss_return_pct", "FLOAT"),
+            ("largest_loss_pct", "FLOAT"),
+            ("largest_win_pct", "FLOAT"),
+            ("drawdown_series_points", "INTEGER"),
+            ("ambiguous_count", "INTEGER"),
+        )
+        for column_name, sql_type in new_columns:
+            if column_name in existing:
+                continue
+            try:
+                with self._engine.begin() as connection:
+                    connection.exec_driver_sql(
+                        f"ALTER TABLE {BacktestSummary.__tablename__} "
+                        f"ADD COLUMN {column_name} {sql_type}"
+                    )
+            except OperationalError as exc:
+                if not self._is_sqlite_duplicate_column_error(exc, column_name):
+                    raise
+        logger.info("[BacktestSummary] ensured v2 risk/quality metric columns")
+
+    def get_price_adjustment_summary(
+        self,
+        code: str,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+    ) -> Dict[str, Any]:
+        """Summarize price-adjustment provenance for a stored daily window.
+
+        Returns ``{"modes": {mode: row_count}, "declared": [...],
+        "unknown_rows": int, "mixed": bool}``. ``mixed`` is True only when two
+        or more *declared* modes coexist (e.g. ``qfq`` + ``none``), which is the
+        corruption signal callers such as the backtest window should surface;
+        unknown (NULL) legacy rows never trigger it.
+        """
+        summary: Dict[str, Any] = {
+            "modes": {},
+            "declared": [],
+            "unknown_rows": 0,
+            "mixed": False,
+        }
+        if not code:
+            return summary
+
+        with self._SessionLocal() as session:
+            conditions = [StockDaily.code == code]
+            if start_date is not None:
+                conditions.append(StockDaily.date >= start_date)
+            if end_date is not None:
+                conditions.append(StockDaily.date <= end_date)
+            rows = session.execute(
+                select(StockDaily.price_adjustment, func.count())
+                .where(and_(*conditions))
+                .group_by(StockDaily.price_adjustment)
+            ).all()
+
+        modes: Dict[str, int] = {}
+        unknown_rows = 0
+        for mode, count in rows:
+            if mode is None or not str(mode).strip():
+                unknown_rows += int(count or 0)
+                continue
+            modes[str(mode).strip().lower()] = modes.get(str(mode).strip().lower(), 0) + int(count or 0)
+
+        summary["modes"] = modes
+        summary["declared"] = sorted(modes)
+        summary["unknown_rows"] = unknown_rows
+        summary["mixed"] = len(modes) > 1
+        return summary
 
     def _derive_canonical_id(self, code: str) -> Optional[str]:
         """Derive a Phase 1 ``canonical_id`` for ``code``.
@@ -3292,15 +3468,16 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             return list(results)
     
     def save_daily_data(
-        self, 
-        df: pd.DataFrame, 
+        self,
+        df: pd.DataFrame,
         code: str,
         data_source: str = "Unknown",
         canonical_id: Optional[str] = None,
+        price_adjustment: Optional[str] = None,
     ) -> int:
         """
         保存日线数据到数据库
-        
+
         策略：
         - 按 `(code, date)` 做批量 UPSERT，已存在记录会覆盖更新
         - 同一批次内若存在重复日期，以最后一条记录为准
@@ -3311,14 +3488,19 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
           仅显式指数形式如 ``sh000300`` / ``930955.CSI`` 推导为指数
           canonical_id；历史被错误写成指数桶的裸码行由
           ``_backfill_canonical_ids()`` 幂等修复），推导失败写 NULL 降级（D1）。
-        
+        - ``price_adjustment``：显式传入则记录；未传时按 ``data_source``
+          在复权口径登记表中解析（各 fetcher 通过 ``price_adjustment``
+          类/实例属性声明）；仍无法解析时写 NULL（未知），不猜测。
+
         Args:
             df: 包含日线数据的 DataFrame
             code: 股票代码
             data_source: 数据来源名称
             canonical_id: Phase 1 前缀格式稳定键（如 ``sh000300``）；为 ``None``
                 时自动推导。
-            
+            price_adjustment: 复权口径（``qfq``/``hfq``/``none``）；为 ``None``
+                时按 ``data_source`` 推导。
+
         Returns:
             本次实际新增的记录数（不含更新）
         """
@@ -3345,6 +3527,13 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 )
                 canonical_id = None
 
+        # 复权口径：显式传入优先，否则按 data_source 在登记表中解析；
+        # 解析不到保持 None（未知），绝不把未知静默写成 none。
+        if price_adjustment is None:
+            price_adjustment = self._resolve_price_adjustment(data_source)
+        elif isinstance(price_adjustment, str):
+            price_adjustment = price_adjustment.strip().lower() or None
+
         now = datetime.now()
         records_by_date: Dict[date, Dict[str, Any]] = {}
         for row in df.to_dict(orient='records'):
@@ -3364,6 +3553,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 'ma20': self._normalize_sql_value(row.get('ma20')),
                 'volume_ratio': self._normalize_sql_value(row.get('volume_ratio')),
                 'data_source': data_source,
+                'price_adjustment': price_adjustment,
                 'canonical_id': canonical_id,
                 'created_at': now,
                 'updated_at': now,
@@ -3422,6 +3612,12 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                                 'ma20': excluded.ma20,
                                 'volume_ratio': excluded.volume_ratio,
                                 'data_source': excluded.data_source,
+                                # 复权口径：未知(None)时保留既有非空值，
+                                # 避免用未声明口径覆盖历史已记录的 qfq/none。
+                                'price_adjustment': func.coalesce(
+                                    excluded.price_adjustment,
+                                    StockDaily.price_adjustment,
+                                ),
                                 # D1 degrade: never overwrite a previously
                                 # backfilled non-NULL canonical_id with NULL.
                                 'canonical_id': func.coalesce(
@@ -3464,6 +3660,8 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                     existing.ma20 = record['ma20']
                     existing.volume_ratio = record['volume_ratio']
                     existing.data_source = record['data_source']
+                    if record['price_adjustment'] is not None:
+                        existing.price_adjustment = record['price_adjustment']
                     if record['canonical_id'] is not None:
                         existing.canonical_id = record['canonical_id']
                     existing.updated_at = record['updated_at']

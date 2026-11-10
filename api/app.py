@@ -294,9 +294,23 @@ async def app_lifespan(app: FastAPI):
     from src.services.name_to_code_resolver import warmup_akshare_cache
 
     warmup_akshare_cache()
+    automation = None
     try:
+        from api.v1.endpoints.research_delivery import get_app_automation, get_service
+        from fastapi import Request
+        if getattr(app.state, 'research_automation', None) is not None or getattr(app.state, 'research_automation_factory', None) is not None:
+            automation = get_app_automation(app)
+        else:
+            service = get_service(Request({'type': 'http', 'app': app}))
+            automation = get_app_automation(app, service)
+        # Local demonstrations can collect and compute without starting the
+        # independent delivery worker. Persisted subscriptions stay untouched.
+        if os.getenv('DSA_RESEARCH_AUTOMATION_SUPPRESS_START', '').strip().lower() not in {'1', 'true', 'yes', 'on'}:
+            automation.start()
         yield
     finally:
+        if automation is not None:
+            automation.stop()
         refresh_task = getattr(app.state, "stock_index_refresh_task", None)
         if refresh_task is not None and not refresh_task.done():
             refresh_task.cancel()
@@ -310,7 +324,7 @@ async def app_lifespan(app: FastAPI):
             delattr(app.state, "runtime_scheduler_service")
 
 
-def create_app(static_dir: Optional[Path] = None) -> FastAPI:
+def create_app(static_dir: Optional[Path] = None, *, research_automation_factory=None) -> FastAPI:
     """
     创建并配置 FastAPI 应用实例
     
@@ -342,6 +356,12 @@ def create_app(static_dir: Optional[Path] = None) -> FastAPI:
         version="1.0.0",
         lifespan=app_lifespan,
     )
+    if research_automation_factory is not None:
+        app.state.research_automation_factory = research_automation_factory
+    # Native ownership is explicit. A bare FastAPI dependency override has no
+    # such provider and must retain its injected service configuration instead.
+    from src.config import get_config
+    app.state.research_automation_config_provider = get_config
     
     # ============================================================
     # CORS 配置

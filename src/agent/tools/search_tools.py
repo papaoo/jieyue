@@ -137,6 +137,10 @@ def _handle_search_stock_news(stock_code: str, stock_name: str) -> dict:
                 "url": r.url,
                 "source": r.source,
                 "published_date": r.published_date,
+                "relevance_category": getattr(r, 'relevance_category', None),
+                "relevance_reasons": getattr(r, 'relevance_reasons', None),
+                "issuer_code": getattr(r, 'issuer_code', None),
+                "evidence_kind": getattr(r, 'evidence_kind', None),
             }
             for r in response.results
         ],
@@ -214,6 +218,12 @@ def _handle_search_comprehensive_intel(stock_code: str, stock_name: str) -> dict
                         "title": r.title,
                         "snippet": r.snippet,
                         "source": r.source,
+                        "url": r.url,
+                        "published_date": r.published_date,
+                        "relevance_category": getattr(r, 'relevance_category', None),
+                        "relevance_reasons": getattr(r, 'relevance_reasons', None),
+                        "issuer_code": getattr(r, 'issuer_code', None),
+                        "evidence_kind": getattr(r, 'evidence_kind', None),
                     }
                     for r in response.results[:3]  # limit to 3 per dimension to save tokens
                 ],

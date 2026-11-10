@@ -3,8 +3,8 @@
 # 资金热度策略
 name: capital_heat
 display_name: 资金热度
-description: 资金活跃、量价同步但未极端过热的短线候选
-version: "1.1"
+description: 基于成交活跃度和量价同步的短线观察候选，不代表已确认资金流入
+version: "2.1"
 category: momentum
 tags: [momentum, capital_flow, short_term]
 analysis_skills: [hot_theme, emotion_cycle]
@@ -17,6 +17,7 @@ style:
   ui_badge: 资金
 
 screening:
+  evidence_mode: daily_required
   enabled: true
   market_scope: [cn]
   hard_filters:
@@ -67,7 +68,7 @@ screening:
     hot_money_penalty: 1.5
   ranking_hints: |
     优先关注：
-    1. 资金热度和价格表现同步，而不是单纯尾盘异动
+    1. 成交活跃度与价格表现同步；量价不能证明机构资金流入
     2. 涨幅尚未透支，量比和换手率处在可持续区间
     3. 板块或主题有扩散迹象，避免孤立脉冲
   max_output: 5

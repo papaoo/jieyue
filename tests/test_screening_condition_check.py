@@ -30,6 +30,7 @@ ALL_FIELDS = {
     "pe_ratio": 5, "pb_ratio": 5, "volume_ratio": 5, "turnover_rate": 5,
     "change_pct": 5, "change_60d": 5, "ma_bullish": True,
     "price_above_ma20": True, "signal_score": 5, "macd_status": "bullish",
+    "volume_contracting": True, "pullback_converging": True, "breakout_confirmed": True,
     "rsi_status": "bullish", "breakout_20d_pct": 5, "range_20d_pct": 5,
     "volume_ratio_20d": 5, "body_pct": 5, "pullback_to_ma20_pct": 5,
     "consolidation_days_20d": 5, "volatility_20d_pct": 5,
@@ -127,7 +128,7 @@ def test_check_endpoint_is_deterministic_and_does_not_run_screening(client):
     assert body["provenance"] == "supplied_snapshot"
     assert body["passed"] is True
     assert body["strategy"] == "dual_low"
-    assert body["strategy_version"] == "1.2"
+    assert body["strategy_version"] == load_all_strategies(STRATEGIES)["dual_low"].version
     expected = load_all_strategies(STRATEGIES)["dual_low"].screening.hard_filters
     assert body["checks"] == check_hard_filters(SNAPSHOT, expected)
     assert "snapshot_source" not in body and "run_id" not in body

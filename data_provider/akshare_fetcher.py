@@ -24,13 +24,15 @@ AkshareFetcher - 主数据源 (Priority 1)
 """
 
 import logging
+import json
+import math
 import multiprocessing
 import os
 import random
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List, Tuple
 
 import pandas as pd
@@ -415,6 +417,7 @@ class AkshareFetcher(BaseFetcher):
     """
     
     name = "AkshareFetcher"
+    price_adjustment = "qfq"  # 前复权日线（fqt=1 / adjustflag=2 / auto_adjust 等，详见各自实现）
     priority = int(os.getenv("AKSHARE_PRIORITY", "1"))
     
     def __init__(self, sleep_min: float = 2.0, sleep_max: float = 5.0):
@@ -705,6 +708,7 @@ class AkshareFetcher(BaseFetcher):
                     'close': '收盘', 'volume': '成交量', 'amount': '成交额'
                 }
                 df = df.rename(columns=rename_map)
+                df.attrs['volume_unit'] = 'shares'  # stock_zh_a_daily returns shares
 
                 # 计算涨跌幅（新浪接口可能不返回）
                 if '收盘' in df.columns:
@@ -749,6 +753,7 @@ class AkshareFetcher(BaseFetcher):
                     'amount': '成交额'
                 }
                 df = df.rename(columns=rename_map)
+                df.attrs['volume_unit'] = 'shares'  # stock_zh_a_hist_tx returns shares
 
                 # 腾讯数据通常包含 '涨跌幅'，如果没有则计算
                 if 'pct_chg' in df.columns:
@@ -815,6 +820,10 @@ class AkshareFetcher(BaseFetcher):
             return df
             
         except Exception as e:
+            from .base import safe_exception_details_enabled
+
+            if safe_exception_details_enabled():
+                raise DataFetchError("source_request_failed") from None
             error_msg = str(e).lower()
             
             # 检测反爬封禁
@@ -1009,6 +1018,12 @@ class AkshareFetcher(BaseFetcher):
         
         # 重命名列
         df = df.rename(columns=column_mapping)
+        code = normalize_stock_code(stock_code)
+        if (code.isdigit() and len(code) == 6 and 'volume' in df.columns
+                and df.attrs.get('volume_unit') != 'shares'):
+            # Eastmoney stock/ETF bars use lots; Sina/Tencent paths mark shares.
+            df['volume'] = pd.to_numeric(df['volume'], errors='coerce') * 100
+        df.attrs['volume_unit'] = 'shares'
 
         # 添加股票代码列
         df['code'] = stock_code
@@ -1189,7 +1204,7 @@ class AkshareFetcher(BaseFetcher):
                 price=safe_float(row.get('最新价')),
                 change_pct=safe_float(row.get('涨跌幅')),
                 change_amount=safe_float(row.get('涨跌额')),
-                volume=safe_int(row.get('成交量')),
+                volume=(safe_int(row.get('成交量')) * 100 if safe_int(row.get('成交量')) is not None else None),
                 amount=safe_float(row.get('成交额')),
                 volume_ratio=safe_float(row.get('量比')),
                 turnover_rate=safe_float(row.get('换手率')),
@@ -1595,7 +1610,7 @@ class AkshareFetcher(BaseFetcher):
                 price=safe_float(row.get('最新价')),
                 change_pct=safe_float(row.get('涨跌幅')),
                 change_amount=safe_float(row.get('涨跌额')),
-                volume=safe_int(row.get('成交量')),
+                volume=(safe_int(row.get('成交量')) * 100 if safe_int(row.get('成交量')) is not None else None),
                 amount=safe_float(row.get('成交额')),
                 volume_ratio=safe_float(row.get('量比')),
                 turnover_rate=safe_float(row.get('换手率')),
@@ -1894,7 +1909,7 @@ class AkshareFetcher(BaseFetcher):
             
         except Exception as e:
             logger.error(f"[API错误] 获取 {stock_code} 筹码分布失败: {e}")
-            return None
+            raise  # The manager records the actual failure class and fails open.
     
     def get_enhanced_data(self, stock_code: str, days: int = 60) -> Dict[str, Any]:
         """
@@ -2242,6 +2257,32 @@ class AkshareFetcher(BaseFetcher):
             logger.error(f"[Akshare] 新浪接口获取板块排行也失败: {e}")
             return None
 
+    def get_sina_concept_rankings(self, n: int = 5) -> Optional[Tuple[List[Dict], List[Dict]]]:
+        """Independent free concept classification; the upstream supplies no business date."""
+        url = "https://money.finance.sina.com.cn/q/view/newFLJK.php"
+        response = requests.get(url, params={"param": "class"}, timeout=(2, 4))
+        response.raise_for_status()
+        response.encoding = "gbk"
+        payload = json.loads(response.text.split("=", 1)[1].strip().rstrip(";"))
+        acquired = datetime.now(timezone.utc).isoformat()
+        rows = []
+        for raw in payload.values():
+            parts = str(raw).split(",")
+            if len(parts) != 13 or not parts[1]:
+                continue
+            try:
+                change = float(parts[5])
+                if not math.isfinite(change) or int(parts[2]) <= 0:
+                    continue
+            except (ValueError, TypeError):
+                continue
+            rows.append({"code": parts[0], "name": parts[1], "change_pct": change,
+                         "source": "sina", "source_url": url, "as_of": None,
+                         "updated_at": acquired, "raw_count": len(payload),
+                         "definition": "新浪概念分类快照；业务日期未提供，仅作背景，不等于东财概念指数"})
+        ordered = sorted(rows, key=lambda row: row["change_pct"], reverse=True)
+        return ordered[:n], list(reversed(ordered))[:n]
+
     def get_concept_rankings(self, n: int = 5) -> Optional[Tuple[List[Dict], List[Dict]]]:
         """获取概念/题材涨跌榜。"""
         import akshare as ak
@@ -2251,6 +2292,12 @@ class AkshareFetcher(BaseFetcher):
             self._enforce_rate_limit()
 
             logger.info("[API调用] ak.stock_board_concept_name_em() 获取概念排行...")
+            # AKShare caches this quote snapshot indefinitely inside its wrapper.
+            # Our manager owns the TTL; expire the upstream snapshot before fetching.
+            from akshare.stock import stock_board_concept_em
+            cached_fetch = getattr(stock_board_concept_em, "__stock_board_concept_name_em", None)
+            if callable(getattr(cached_fetch, "cache_clear", None)):
+                cached_fetch.cache_clear()
             df = ak.stock_board_concept_name_em()
             if df is None or df.empty:
                 return None
@@ -2265,13 +2312,16 @@ class AkshareFetcher(BaseFetcher):
             df = df.dropna(subset=[change_col])
             top = df.nlargest(n, change_col)
             bottom = df.nsmallest(n, change_col)
+            metadata = {"source": "eastmoney", "as_of": None,
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                        "definition": "东财概念分类快照；接口未提供业务日期，仅作背景"}
             return (
                 [
-                    {'name': str(row[name_col]), 'change_pct': float(row[change_col])}
+                    {'name': str(row[name_col]), 'change_pct': float(row[change_col]), **metadata}
                     for _, row in top.iterrows()
                 ],
                 [
-                    {'name': str(row[name_col]), 'change_pct': float(row[change_col])}
+                    {'name': str(row[name_col]), 'change_pct': float(row[change_col]), **metadata}
                     for _, row in bottom.iterrows()
                 ],
             )

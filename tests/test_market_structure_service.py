@@ -725,7 +725,7 @@ def test_market_structure_service_combines_market_and_stock_layers() -> None:
     assert context["market_theme_context"]["active_themes"][0]["name"] == "机器人概念"
     position = context["stock_market_position"]
     assert position["primary_theme"]["name"] == "机器人概念"
-    assert position["theme_phase"] == "accelerating"
+    assert position["theme_phase"] == "unknown"
     assert position["stock_role"] == "edge"
     assert "leader_stocks" in position["missing_fields"]
 
@@ -861,7 +861,7 @@ def test_market_structure_service_infers_concept_board_from_missing_type_name() 
     assert position["status"] == "partial"
     assert position["primary_theme"]["source"] == "concept"
     assert position["primary_theme"]["change_pct"] == 4.2
-    assert position["theme_phase"] == "accelerating"
+    assert position["theme_phase"] == "unknown"
     assert position["related_boards"][0]["source"] == "concept"
     assert position["stock_role"] == "edge"
     assert "theme_ranking_match" in position["missing_fields"]
@@ -903,7 +903,7 @@ def test_market_structure_service_resolves_missing_type_board_from_concept_ranki
     assert position["status"] == "partial"
     assert position["primary_theme"]["source"] == "concept"
     assert position["primary_theme"]["change_pct"] == 5.6
-    assert position["theme_phase"] == "accelerating"
+    assert position["theme_phase"] == "unknown"
     assert position["stock_role"] == "edge"
     assert "theme_ranking_match" in position["missing_fields"]
     assert position["related_boards"][0]["source"] == "concept"
@@ -956,7 +956,7 @@ def test_market_structure_service_uses_lagging_themes_for_board_match() -> None:
     position = context["stock_market_position"]
     assert position["status"] == "partial"
     assert position["primary_theme"]["name"] == "转基因"
-    assert position["theme_phase"] == "cooling"
+    assert position["theme_phase"] == "unknown"
     assert position["stock_role"] == "edge"
     assert position["related_boards"][0]["name"] == "转基因"
     assert position["related_boards"][0]["source"] == "concept"
@@ -1090,7 +1090,7 @@ def test_market_structure_service_prefers_board_source_for_primary_theme() -> No
     assert position["primary_theme"]["name"] == "新能源"
     assert position["primary_theme"]["source"] == "industry"
     assert position["primary_theme"]["change_pct"] == 2.0
-    assert position["primary_theme"]["phase"] == "warming"
+    assert position["primary_theme"]["phase"] == "unknown"
     assert position["stock_role"] == "edge"
     assert "theme_ranking_match" not in position["missing_fields"]
 

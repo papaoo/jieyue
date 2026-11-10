@@ -3,8 +3,8 @@
 # 趋势质量策略
 name: momentum_quality
 display_name: 趋势质量
-description: 兼顾趋势确认和基本面质量的中线候选发现
-version: "1.1"
+description: 兼顾趋势、估值与价格稳定性代理的中线观察候选，未验证财务质量
+version: "2.1"
 category: framework
 tags: [momentum, quality, trend, llm_friendly]
 analysis_skills: [bull_trend, growth_quality]
@@ -17,6 +17,7 @@ style:
   ui_badge: 趋势
 
 screening:
+  evidence_mode: daily_required
   enabled: true
   market_scope: [cn]
   hard_filters:
@@ -70,6 +71,6 @@ screening:
   ranking_hints: |
     优先关注：
     1. 已经确认趋势但还没有进入极端追涨阶段的候选
-    2. 基本面质量（估值、资金活跃、稳定性）能为趋势提供支撑
+    2. 估值、成交活跃度与价格稳定性代理支持趋势；财务质量仍需独立核验
     3. 避免单一题材过度集中，兼顾不同风格的趋势机会
   max_output: 5

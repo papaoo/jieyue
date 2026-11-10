@@ -31,6 +31,7 @@ _TOP_LEVEL_KEYS = {
     "screening",
 }
 _SCREENING_KEYS = {
+    "evidence_mode",
     "enabled",
     "market_scope",
     "hard_filters",
@@ -209,6 +210,7 @@ def load_strategy(filepath: Path) -> Strategy:
     hard_filters = HardFilterConfig(**hf_data)
 
     screening = ScreeningConfig(
+        evidence_mode=screening_data.get("evidence_mode", "legacy"),
         enabled=screening_data.get("enabled", False),
         market_scope=screening_data.get("market_scope", ["cn"]),
         hard_filters=hard_filters,
@@ -287,7 +289,7 @@ def _strategy_dir_signature(strategies_dir: Path) -> tuple[tuple[str, int, int, 
 def list_strategies(strategies_dir: Path | None = None) -> list[StrategyInfo]:
     """List available screening strategies."""
     from src.services.screening.config import Config
-    from src.services.screening.filter import requires_daily_features
+    from src.services.screening.requirements import requires_daily_evidence, required_daily_fields
 
     if strategies_dir is None:
         strategies_dir = Config.from_env().strategies_dir
@@ -295,7 +297,7 @@ def list_strategies(strategies_dir: Path | None = None) -> list[StrategyInfo]:
     strategies = load_all_strategies(strategies_dir)
     infos: list[StrategyInfo] = []
     for s in strategies.values():
-        daily_required = requires_daily_features(s.screening.hard_filters)
+        daily_required = requires_daily_evidence(s.screening)
         infos.append(StrategyInfo(
             name=s.name,
             display_name=s.display_name,
@@ -308,7 +310,7 @@ def list_strategies(strategies_dir: Path | None = None) -> list[StrategyInfo]:
             requires_daily_features=daily_required,
             data_requirements=_strategy_data_requirements(s, daily_required=daily_required),
             required_snapshot_fields=_required_snapshot_fields(s.screening.hard_filters),
-            required_daily_fields=_required_daily_fields(s.screening.hard_filters),
+            required_daily_fields=list(required_daily_fields(s.screening)),
             active_filters=_active_hard_filters(s.screening.hard_filters),
             factor_weights={key: float(value) for key, value in s.screening.factor_weights.items()},
             profile_keys=_strategy_profile_keys(s.screening),
@@ -577,7 +579,7 @@ def compare_strategies(
 ) -> dict[str, object]:
     """Compare two enabled strategies for strategy review and UI diff views."""
     from src.services.screening.config import Config
-    from src.services.screening.filter import requires_daily_features
+    from src.services.screening.requirements import requires_daily_evidence, required_daily_fields
 
     if strategies_dir is None:
         strategies_dir = Config.from_env().strategies_dir
@@ -589,8 +591,8 @@ def compare_strategies(
         missing = exc.args[0]
         raise ValueError(f"Strategy '{missing}' not found") from exc
 
-    base_daily = requires_daily_features(base.screening.hard_filters)
-    target_daily = requires_daily_features(target.screening.hard_filters)
+    base_daily = requires_daily_evidence(base.screening)
+    target_daily = requires_daily_evidence(target.screening)
     differences = {
         "identity": _mapping_diff(
             {
@@ -617,8 +619,8 @@ def compare_strategies(
             _required_snapshot_fields(target.screening.hard_filters),
         ),
         "required_daily_fields": _list_diff(
-            _required_daily_fields(base.screening.hard_filters),
-            _required_daily_fields(target.screening.hard_filters),
+            list(required_daily_fields(base.screening)),
+            list(required_daily_fields(target.screening)),
         ),
         "active_filters": _list_diff(
             _active_hard_filters(base.screening.hard_filters),
@@ -813,6 +815,9 @@ def _required_snapshot_fields(filters_config: HardFilterConfig) -> list[str]:
 
 def _required_daily_fields(filters_config: HardFilterConfig) -> list[str]:
     checks = [
+        ("volume_contracting", filters_config.require_volume_contraction),
+        ("pullback_converging", filters_config.require_pullback_convergence),
+        ("breakout_confirmed", filters_config.require_breakout_confirmation),
         ("change_60d", filters_config.change_60d_min is not None or filters_config.change_60d_max is not None),
         ("ma_bullish", filters_config.require_ma_bullish),
         ("price_above_ma20", filters_config.require_price_above_ma20),

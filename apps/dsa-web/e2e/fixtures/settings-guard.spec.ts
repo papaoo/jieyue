@@ -126,7 +126,7 @@ test('protected deep links survive the data-router login boundary', async ({ pag
   await page.goto('/settings?category=system#desktop-version-info');
   await expect(page).toHaveURL(/\/login\?redirect=%2Fsettings%3Fcategory%3Dsystem%23desktop-version-info$/);
   await page.locator('#password').fill('fixture-only-password');
-  await page.getByRole('button', { name: '授权进入工作台', exact: true }).click();
+  await page.getByRole('button', { name: '进入工作台', exact: true }).click();
   await expect(page).toHaveURL(/\/settings\?category=system#desktop-version-info$/);
   await expect(page.getByTestId('scheduler-enabled-checkbox')).toBeVisible();
 });
@@ -135,7 +135,7 @@ test('accepted backup import discards hidden model drafts and scheduler override
   await fixture(page, true);
   await page.goto('/settings');
   await page.locator('#password').fill('fixture-only-password');
-  await page.getByRole('button', { name: '授权进入工作台', exact: true }).click();
+  await page.getByRole('button', { name: '进入工作台', exact: true }).click();
   const categories = page.getByRole('navigation', { name: '配置分类' });
   await categories.getByRole('button', { name: /AI 模型/ }).click();
   await page.getByRole('button', { name: /primary/i }).click();
@@ -168,7 +168,7 @@ test('logout explicitly confirms draft loss and Cancel preserves the session', a
   });
   await page.goto('/settings');
   await page.locator('#password').fill('fixture-only-password');
-  await page.getByRole('button', { name: '授权进入工作台', exact: true }).click();
+  await page.getByRole('button', { name: '进入工作台', exact: true }).click();
   const input = page.getByRole('textbox', { name: 'Fixture value' });
   await input.fill('keep-until-confirmed');
   await page.getByRole('button', { name: '退出', exact: true }).click();

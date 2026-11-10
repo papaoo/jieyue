@@ -26,6 +26,7 @@ _AV_BASE_URL = "https://www.alphavantage.co/query"
 
 class AlphaVantageFetcher(BaseFetcher):
     name = "AlphaVantageFetcher"
+    price_adjustment = "none"  # 日线为原始未复权价
     priority = 3
 
     def __init__(self):

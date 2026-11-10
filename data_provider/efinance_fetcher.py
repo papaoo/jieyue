@@ -279,6 +279,7 @@ class EfinanceFetcher(BaseFetcher):
     """
     
     name = "EfinanceFetcher"
+    price_adjustment = "qfq"  # 前复权日线（fqt=1 / adjustflag=2 / auto_adjust 等，详见各自实现）
     priority = int(os.getenv("EFINANCE_PRIORITY", "0"))  # 最高优先级，排在 AkshareFetcher 之前
     
     def __init__(self, sleep_min: float = 1.5, sleep_max: float = 3.0):
@@ -305,13 +306,20 @@ class EfinanceFetcher(BaseFetcher):
         elapsed: float,
         is_etf: bool = False,
     ) -> Tuple[str, str]:
-        category, detail = _classify_eastmoney_error(exc)
+        from .base import safe_exception_details_enabled, summarize_exception
+
+        if is_etf and safe_exception_details_enabled():
+            error_type, detail = summarize_exception(exc)
+            category = "source_request_failed"
+        else:
+            category, detail = _classify_eastmoney_error(exc)
+            error_type = type(exc).__name__
         instrument_type = "ETF" if is_etf else "stock"
         message = (
             "Eastmoney 历史K线接口失败: "
             f"endpoint={EASTMONEY_HISTORY_ENDPOINT}, stock_code={stock_code}, "
             f"market_type={instrument_type}, range={beg_date}~{end_date}, "
-            f"category={category}, error_type={type(exc).__name__}, elapsed={elapsed:.2f}s, detail={detail}"
+            f"category={category}, error_type={error_type}, elapsed={elapsed:.2f}s, detail={detail}"
         )
         return category, message
 
@@ -596,6 +604,10 @@ class EfinanceFetcher(BaseFetcher):
         
         # 重命名列
         df = df.rename(columns=column_mapping)
+        code = normalize_stock_code(stock_code)
+        if code.isdigit() and len(code) == 6 and 'volume' in df.columns:
+            df['volume'] = pd.to_numeric(df['volume'], errors='coerce') * 100
+        df.attrs['volume_unit'] = 'shares'
         
         # Fallback: if OHLC columns are missing (e.g. very old data path), fill from close
         if 'close' in df.columns and 'open' not in df.columns:
@@ -720,7 +732,7 @@ class EfinanceFetcher(BaseFetcher):
                 price=safe_float(row.get(price_col)),
                 change_pct=safe_float(row.get(pct_col)),
                 change_amount=safe_float(row.get(chg_col)),
-                volume=safe_int(row.get(vol_col)),
+                volume=(safe_int(row.get(vol_col)) * 100 if safe_int(row.get(vol_col)) is not None else None),
                 amount=safe_float(row.get(amt_col)),
                 turnover_rate=safe_float(row.get(turn_col)),
                 amplitude=safe_float(row.get(amp_col)),
@@ -804,7 +816,7 @@ class EfinanceFetcher(BaseFetcher):
                 price=price,
                 change_pct=safe_float(data.get("f170")),
                 change_amount=safe_float(data.get("f169")),
-                volume=safe_int(data.get("f47")),
+                volume=(safe_int(data.get("f47")) * 100 if safe_int(data.get("f47")) is not None else None),
                 amount=safe_float(data.get("f48")),
                 amplitude=safe_float(data.get("f171")),
                 high=safe_float(data.get("f44")),
@@ -902,7 +914,7 @@ class EfinanceFetcher(BaseFetcher):
                 price=safe_float(row.get(price_col)),
                 change_pct=safe_float(row.get(pct_col)),
                 change_amount=safe_float(row.get(chg_col)),
-                volume=safe_int(row.get(vol_col)),
+                volume=(safe_int(row.get(vol_col)) * 100 if safe_int(row.get(vol_col)) is not None else None),
                 amount=safe_float(row.get(amt_col)),
                 turnover_rate=safe_float(row.get(turn_col)),
                 amplitude=safe_float(row.get(amp_col)),

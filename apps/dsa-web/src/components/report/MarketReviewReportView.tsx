@@ -8,6 +8,7 @@ import type {
   MarketReviewPayload,
   MarketReviewPayloadSection,
   ReportLanguage,
+  SectorRankingItem,
 } from '../../types/analysis';
 import { markdownToPlainText } from '../../utils/markdown';
 import { getReportText, normalizeReportLanguage } from '../../utils/reportLanguage';
@@ -351,6 +352,37 @@ const MARKET_REVIEW_TEXT: Record<ReportLanguage, {
   },
 };
 
+const rankingDate = (value: string | undefined): string | undefined => {
+  // Validate the entire supported ISO date/timestamp before taking its date.
+  if (!value || !/^\d{4}-\d{2}-\d{2}(?:T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{1,3})?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)?)?$/.test(value)) return undefined;
+  const day = value.slice(0, 10);
+  return Number.isFinite(Date.parse(value)) && Number.isFinite(Date.parse(day)) && new Date(day).toISOString().slice(0, 10) === day ? day : undefined;
+};
+
+const rankingMetadata = (rankings: MarketReviewPayload['sectors'], rows: SectorRankingItem[], english: boolean): string => {
+  // Saved history may attach metadata to each row, not the ranking container.
+  // Row metadata takes precedence; never infer a data date from report creation.
+  const values = rows.map(row => ({
+    date: rankingDate(row.asOf ?? rankings?.asOf),
+    source: row.source ?? rankings?.source,
+    definition: row.definition ?? rankings?.definition,
+  }));
+  const knownDates = values.map(row => row.date).filter((day): day is string => Boolean(day && /^\d{4}-\d{2}-\d{2}$/.test(day) && Number.isFinite(Date.parse(day)) && new Date(day).toISOString().slice(0, 10) === day));
+  const dates = [...new Set(knownDates)].sort();
+  const dateText = dates.length ? `${english ? 'Data date' : '数据日期'}：${dates[0]}${dates.length > 1 ? ` ${english ? 'to' : '至'} ${dates[dates.length - 1]}（${english ? 'mixed dates' : '日期混合'}）` : ''}${knownDates.length < rows.length ? (english ? ' · Some dates unknown' : ' · 部分日期未知') : ''}`
+    : (english ? 'Data date unknown' : '数据日期未知');
+  const today = new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' });
+  const historical = dates.some(day => day < today) ? (english ? 'Historical data, not current quotes' : '含历史数据，非当日行情') : '';
+  const sources = [...new Set(values.map(row => row.source).filter(Boolean))];
+  const sourceText = sources.length > 1 ? (english ? 'Mixed sources' : '来源混合')
+    : sources[0] ? `${sources[0]}${values.some(row => !row.source) ? (english ? ' (some sources unknown)' : '（部分来源未知）') : ''}` : '';
+  const definitions = [...new Set(values.map(row => row.definition))];
+  const equalWeight = definitions.length === 1 && ['equal_weight_observed_constituents', 'equal_weight_return_of_observed_traded_constituents'].includes(definitions[0] ?? '');
+  const definitionText = equalWeight ? (english ? 'Equal-weight mean of observed constituents, not a sector index' : '已观测成分等权均值，非板块指数')
+    : definitions.length > 1 ? (english ? 'Mixed or partly unknown definitions' : '口径混合或部分未知') : '';
+  return [dateText, historical, sourceText, definitionText].filter(Boolean).join(' · ');
+};
+
 const formatRankingChange = (value: unknown): string => {
   const numeric = typeof value === 'number' ? value : Number(String(value ?? '').replace(/%$/, ''));
   if (!Number.isFinite(numeric)) {
@@ -658,7 +690,7 @@ export const MarketReviewReportView: React.FC<MarketReviewReportViewProps> = ({
                     title: string,
                     rankings: MarketReviewPayload['sectors'],
                   ) => (['top', 'bottom'] as const).map((side) => {
-                    const rows = rankings?.[side] || [];
+                    const rows = (rankings?.[side] || []).slice(0, 5);
                     if (rows.length === 0) {
                       return null;
                     }
@@ -670,8 +702,11 @@ export const MarketReviewReportView: React.FC<MarketReviewReportViewProps> = ({
                             {side === 'top' ? marketReviewText.leading : marketReviewText.lagging}
                           </span>
                         </div>
+                        <p className="mb-2 text-xs leading-5 text-secondary-text">
+                          {rankingMetadata(rankings, rows, reportLanguage === 'en')}
+                        </p>
                         <div className="space-y-1.5">
-                          {rows.slice(0, 5).map((item, index) => (
+                          {rows.map((item, index) => (
                             <div key={`${item.name}-${index}`} className="flex items-center justify-between gap-3 text-sm">
                               <span className="min-w-0 truncate text-foreground">{item.name}</span>
                               <span className="shrink-0 font-mono text-secondary-text">

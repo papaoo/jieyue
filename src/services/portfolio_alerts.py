@@ -248,6 +248,19 @@ def evaluate_portfolio_risk_alert(
         return _evaluate_price_stale(rule, snapshot)
 
     report = risk.get_risk_report(account_id=account_id, cost_method="fifo")
+    block_name = {
+        "portfolio_stop_loss": "stop_loss",
+        "portfolio_concentration": "concentration",
+        "portfolio_drawdown": "drawdown",
+    }.get(rule.alert_type)
+    block = report.get(block_name, {}) if block_name else {}
+    if block.get("available") is False:
+        return _portfolio_result(
+            rule, triggered=False, observed_value=None, threshold=None,
+            message="Portfolio valuation is incomplete; risk evaluation skipped",
+            record_status="degraded",
+            diagnostics={**_base_diagnostics(report), "data_available": False, "reason": block.get("reason")},
+        )
     if rule.alert_type == "portfolio_stop_loss":
         return _evaluate_stop_loss(rule, report)
     if rule.alert_type == "portfolio_concentration":

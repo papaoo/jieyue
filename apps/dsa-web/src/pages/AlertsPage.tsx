@@ -23,6 +23,8 @@ import type {
   AlertType,
 } from '../types/alerts';
 import { formatDateTime } from '../utils/format';
+import { useUiLanguage } from '../contexts/UiLanguageContext';
+import { BRAND } from '../config/brand';
 
 const PAGE_SIZE = 20;
 
@@ -99,9 +101,10 @@ function formatNotificationStatus(notification: AlertNotificationItem): string {
 }
 
 const AlertsPage: React.FC = () => {
+  const { t, language } = useUiLanguage();
   useEffect(() => {
-    document.title = '告警中心 - DSA';
-  }, []);
+    document.title = `${t('layout.route.alerts.title')} - ${language === 'zh' ? BRAND.name : BRAND.englishName}`;
+  }, [t, language]);
 
   const [rules, setRules] = useState<AlertRuleItem[]>([]);
   const [rulesTotal, setRulesTotal] = useState(0);

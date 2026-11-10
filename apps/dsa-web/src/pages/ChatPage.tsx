@@ -36,6 +36,7 @@ import {
 import { useStockIndex } from '../hooks/useStockIndex';
 import type { StockIndexItem } from '../types/stockIndex';
 import { useUiLanguage } from '../contexts/UiLanguageContext';
+import { BRAND } from '../config/brand';
 
 // Quick question examples shown on empty state
 type ActiveStockContext = Pick<ChatFollowUpContext, 'stock_code' | 'stock_name'>;
@@ -242,7 +243,7 @@ const restoreActiveStockContextFromMessages = (
 };
 
 const ChatPage: React.FC = () => {
-  const { t } = useUiLanguage();
+  const { t, language } = useUiLanguage();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const [input, setInput] = useState('');
@@ -310,8 +311,8 @@ const ChatPage: React.FC = () => {
 
   // Set page title
   useEffect(() => {
-    document.title = '问股 - DSA';
-  }, []);
+    document.title = `${t('layout.route.chat.title')} - ${language === 'zh' ? BRAND.name : BRAND.englishName}`;
+  }, [t, language]);
 
   useEffect(() => {
     isMountedRef.current = true;

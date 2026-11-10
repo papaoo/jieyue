@@ -102,15 +102,35 @@ class StockProfileService:
             result = self._stock_service().get_history_data(code, period="daily", days=history_days)
             rows = list(result.get("data") or [])
         except Exception:
+            result = {}
             rows = []
-        if not rows:
-            return {
-                "status": "unavailable",
-                "period": "daily",
-                "data": [],
-                "limitations": ["history_unavailable"],
-            }
-        return {"status": "fresh", "period": "daily", "data": rows, "limitations": []}
+        raw_warnings = result.get("warnings")
+        limitations = list(dict.fromkeys(
+            warning for warning in (raw_warnings if isinstance(raw_warnings, list) else [])
+            if isinstance(warning, str)
+        ))
+        metadata = {
+            key: result.get(key) if isinstance(result.get(key), str) else None
+            for key in ("source", "fetched_at", "adjustment")
+        }
+        if not rows or result.get("status") in {"empty", "unavailable"}:
+            if "history_unavailable" not in limitations:
+                limitations.append("history_unavailable")
+            return {"status": "unavailable", "period": "daily", "data": [], "limitations": limitations, **metadata}
+
+        has_quality_contract = (
+            result.get("status") in {"available", "partial"}
+            and isinstance(raw_warnings, list)
+            and metadata["source"] is not None
+            and metadata["fetched_at"] is not None
+        )
+        if not has_quality_contract:
+            limitations.append("history-freshness-not-verified")
+        status = (
+            "partial" if not has_quality_contract or result.get("status") == "partial"
+            or "freshness-not-verified" in limitations else "fresh"
+        )
+        return {"status": status, "period": "daily", "data": rows, "limitations": limitations, **metadata}
 
     def _research_block(self, code: str, *, market: str) -> Dict[str, Any]:
         empty_data = {"latest_report": None, "recent_reports": [], "structured_report": None}

@@ -312,9 +312,12 @@ class TestReportRenderer(unittest.TestCase):
             out = render("markdown", [r], summary_only=True)
 
         self.assertIsNotNone(out)
-        self.assertIn("报告生成时间：", out)
+        self.assertIn("数据截至：", out)
         self.assertIn("分析模型：gemini/gemini-2.5-flash", out)
         self.assertNotIn("分析模型: gemini/gemini-2.5-flash", out)
+        # 页脚固定携带历史准确率与免责声明（合规兜底）
+        self.assertIn("历史准确率：", out)
+        self.assertIn("仅供参考，不构成投资建议", out)
 
     def test_render_markdown_in_english(self) -> None:
         """Markdown renderer switches headings and summary labels for English reports."""

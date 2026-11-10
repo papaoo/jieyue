@@ -1,0 +1,42 @@
+{
+  "reference_bundle": "data/historical_references",
+  "dataset_path": "data/screening_history.sqlite",
+  "acquisition_end": "2026-10-16",
+  "reference_plan": {
+    "sources": {
+      "capco-guideline.js": {"url": "https://www.capco.org.cn/dataFile/xhdt/tzgg/53b8127cbb9d46f5af59a5a9fce32838.js"},
+      "capco-2025h1.js": {"url": "https://www.capco.org.cn/dataFile/zsxfb/hyfl/hyfljg/29adc9e66d844d6fba0001bb2cdc529c.js"},
+      "capco-2025h1.pdf": {"url": "https://sp.capco.org.cn:82/file/202603/hangyefenlei/2025shangban/hangyefenleigupiaodaima.pdf", "sha256": "b622b76b96d59611db36b01888cf6afd8cd711c5753a19ab8547e74bb0bb8228"},
+      "capco-2025h2.js": {"url": "https://www.capco.org.cn/dataFile/zsxfb/hyfl/hyfljg/d9221cd5eb1448e5956f0e9d84ecba89.js"},
+      "capco-2025h2.pdf": {"url": "https://sp.capco.org.cn:82/file/202604/hangyefenlei/2025xiaban/2025xiabangupiaodaima.pdf", "sha256": "b1d0140572b20de11cd62ca478edb4da6e229928b216116df6345b3c2e461f58"},
+      "capco-2026h1.js": {"url": "https://www.capco.org.cn/dataFile/zsxfb/hyfl/hyfljg/2e1b516684544cc7be7eab6f93f7dddc.js"},
+      "capco-2026h1.pdf": {"url": "https://sp.capco.org.cn:82/file/202609/gwfile/2026shangbangupiaodaima.pdf", "sha256": "1f1862ae2199a82a3a35c62f16a7d576120bca97f3de608989c8897df9b6c8a6"},
+      "bse-2025.html": {"url": "https://www.bse.cn/important_news/200024437.html"},
+      "bse-2026.html": {"url": "https://www.bse.cn/important_news/200027428.html"},
+      "bse-rules-2021.html": {"url": "https://www.bse.cn/jygl_list/200010919.html"},
+      "bse-rules-2026.html": {"url": "https://www.bse.cn/jygl_list/200028217.html"},
+      "bse-aliases.json": {"url": "https://tushare.pro", "api": "bse_mapping", "params": {}},
+      "sse-2025.json": {"url": "https://tushare.pro", "api": "trade_cal", "params": {"exchange": "SSE", "start_date": "20250101", "end_date": "20251231"}},
+      "sse-2026.json": {"url": "https://tushare.pro", "api": "trade_cal", "params": {"exchange": "SSE", "start_date": "20260101", "end_date": "20261231"}},
+      "szse-2025.json": {"url": "https://tushare.pro", "api": "trade_cal", "params": {"exchange": "SZSE", "start_date": "20250101", "end_date": "20251231"}},
+      "szse-2026.json": {"url": "https://tushare.pro", "api": "trade_cal", "params": {"exchange": "SZSE", "start_date": "20260101", "end_date": "20261231"}}
+    },
+    "guideline": "capco-guideline.js",
+    "aliases": "bse-aliases.json",
+    "reports": [
+      {"period": "2025H1", "published_on": "2025-09-30", "inclusion_cutoff": "2025-06-10", "valid_through": "2026-12-31", "expected_rows": 5413, "pdf": "capco-2025h1.pdf", "article": "capco-2025h1.js"},
+      {"period": "2025H2", "published_on": "2026-04-03", "inclusion_cutoff": "2025-12-20", "valid_through": "2026-12-31", "expected_rows": 5463, "pdf": "capco-2025h2.pdf", "article": "capco-2025h2.js"},
+      {"period": "2026H1", "published_on": "2026-09-30", "inclusion_cutoff": "2026-06-10", "valid_through": "2026-12-31", "expected_rows": 5521, "pdf": "capco-2026h1.pdf", "article": "capco-2026h1.js"}
+    ],
+    "bse_calendars": [
+      {"year": 2025, "published_on": "2024-12-23", "notice": "bse-2025.html", "rule": "bse-rules-2021.html"},
+      {"year": 2026, "published_on": "2025-12-22", "notice": "bse-2026.html", "rule": "bse-rules-2021.html", "additional_rules": ["bse-rules-2026.html"]}
+    ],
+    "exchange_calendars": [
+      {"exchange": "SSE", "year": 2025, "source": "sse-2025.json"},
+      {"exchange": "SSE", "year": 2026, "source": "sse-2026.json"},
+      {"exchange": "SZSE", "year": 2025, "source": "szse-2025.json"},
+      {"exchange": "SZSE", "year": 2026, "source": "szse-2026.json"}
+    ]
+  }
+}

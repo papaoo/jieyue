@@ -8,6 +8,9 @@ import type { SetupStatusResponse } from '../../types/systemConfig';
 import SettingsPage from '../SettingsPage';
 import { DesktopUpdateIndicator } from '../../components/layout/DesktopUpdateIndicator';
 
+// The real independent draft owner is exercised by its component tests and browser fixtures.
+vi.mock('../../components/settings/ResearchDeliveryPanel', () => ({ ResearchDeliveryPanel: ({ onDirtyChange, visible }: { onDirtyChange: (dirty: boolean) => void; visible: boolean }) => <div data-testid="research-panel" data-visible={String(visible)}>多群研究推送<button onClick={() => onDirtyChange(true)}>edit research draft</button></div> }));
+
 function renderSettingsPage(initialEntries: string[] = ['/settings']) {
   const router = createMemoryRouter(
     [
@@ -2504,15 +2507,32 @@ describe('SettingsPage', () => {
     expect(screen.queryByTestId('settings-field-LLM_MY_PROXY_MODELS')).not.toBeInTheDocument();
   });
 
-  it('renders notification test panel before notification fields', () => {
+  it('separates research setup from legacy fields and global save', () => {
     useSystemConfigMock.mockReturnValue(buildSystemConfigState({ activeCategory: 'notification' }));
 
     renderSettingsPage();
 
+    expect(screen.getByText('多群研究推送')).toBeInTheDocument();
+    expect(screen.queryByText('通知测试面板:WECHAT_WEBHOOK_URL')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^保存配置/ })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '其他渠道与旧版通知' }));
     expect(screen.getByText('通知测试面板:WECHAT_WEBHOOK_URL')).toBeInTheDocument();
     expect(screen.getByText('WECHAT_WEBHOOK_URL')).toBeInTheDocument();
     expect(settingsPanelErrorBoundary).toHaveBeenCalledWith('通知测试');
     expect(settingsPanelErrorBoundary).toHaveBeenCalledWith('通知设置');
+  });
+
+  it('marks retained dirty research panel invisible in legacy mode without discarding its draft owner', () => {
+    useSystemConfigMock.mockReturnValue(buildSystemConfigState({ activeCategory: 'notification' }));
+    renderSettingsPage();
+    expect(screen.getByTestId('research-panel')).toHaveAttribute('data-visible', 'true');
+    fireEvent.click(screen.getByRole('button', { name: 'edit research draft' }));
+    fireEvent.click(screen.getByRole('button', { name: '其他渠道与旧版通知' }));
+    expect(screen.getByTestId('research-panel')).toHaveAttribute('data-visible', 'false');
+    expect(screen.getByTestId('research-panel')).not.toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: '飞书多群订阅' }));
+    expect(screen.getByTestId('research-panel')).toHaveAttribute('data-visible', 'true');
+    expect(screen.getByRole('button', { name: '放弃未保存草稿' })).not.toBeDisabled();
   });
 
   it('uses browser and backend logs in settings panel diagnostic hints outside desktop runtime', () => {
@@ -2520,7 +2540,7 @@ describe('SettingsPage', () => {
 
     renderSettingsPage();
 
-    expect(screen.getAllByText(/浏览器开发者工具控制台与后端日志/)).toHaveLength(2);
+    expect(screen.getAllByText(/浏览器开发者工具控制台与后端日志/)).toHaveLength(1);
     expect(screen.queryByText('desktop.log')).not.toBeInTheDocument();
   });
 
@@ -2530,7 +2550,7 @@ describe('SettingsPage', () => {
 
     renderSettingsPage();
 
-    expect(screen.getAllByText('desktop.log')).toHaveLength(2);
+    expect(screen.getAllByText('desktop.log')).toHaveLength(1);
     expect(screen.queryByText(/浏览器开发者工具控制台与后端日志/)).not.toBeInTheDocument();
   });
 
@@ -2939,6 +2959,22 @@ describe('SettingsPage', () => {
 
     afterEach(() => {
       vi.restoreAllMocks();
+    });
+
+    it('discarding research draft preserves a hidden real LLM draft', async () => {
+      editorTestMode.real = true;
+      useSystemConfigMock.mockReturnValue(buildSystemConfigState({ activeCategory: 'ai_model', hasDirty: false }));
+      const page = renderSettingsPage();
+      fireEvent.click(await screen.findByRole('button', { name: /primary/i }));
+      fireEvent.change(await screen.findByLabelText('渠道名称'), { target: { value: 'UNSAVED_NAME' } });
+      useSystemConfigMock.mockReturnValue(buildSystemConfigState({ activeCategory: 'notification', hasDirty: false }));
+      page.rerenderSettingsPage();
+      fireEvent.click(await screen.findByRole('button', { name: 'edit research draft' }));
+      fireEvent.click(screen.getByRole('button', { name: '放弃未保存草稿' }));
+      useSystemConfigMock.mockReturnValue(buildSystemConfigState({ activeCategory: 'ai_model', hasDirty: false }));
+      page.rerenderSettingsPage();
+      expect(await screen.findByLabelText('渠道名称')).toHaveValue('unsaved_name');
+      expect(beforeUnloadListeners.length).toBe(1);
     });
 
     it('retains real LLM drafts and both guards across category changes', async () => {

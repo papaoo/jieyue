@@ -6,10 +6,17 @@
 {{ market_status_line }}
 {% endif %}
 
+## 🙋 {{ labels.newcomer_guide_heading }}
+
+{% for guide_line in newcomer_guide_lines %}
+{{ guide_line }}
+{% endfor %}
+
 ## 📊 {{ labels.summary_heading }}
 
 {% for e in enriched %}
-{{ e.signal_emoji }} **{{ e.stock_name }}({{ e.result.code }})**: {{ e.signal_text }} | {{ labels.score_label }} {{ e.result.sentiment_score }} | {{ e.localized_trend_prediction }}
+{% set plainly = describe_sentiment_plainly(e.result.sentiment_score, report_language) %}
+{{ e.signal_emoji }} **{{ e.stock_name }}({{ e.result.code }})**: {{ e.signal_text }} | {{ labels.score_label }} {{ e.result.sentiment_score }}{% if plainly %} | {{ labels.score_plainly_label }}：{{ plainly }}{% endif %} | {{ e.localized_trend_prediction }}
 {% if summary_only and e.empty_news_disclosure %}
 {{ e.empty_news_disclosure }}
 {% endif %}
@@ -114,6 +121,9 @@
 **{{ labels.chip_label }}**: {{ chip_data.get('profit_ratio', 'N/A') }} | {{ chip_data.get('avg_cost', 'N/A') }} | {{ chip_data.get('concentration', 'N/A') }} {{ localize_chip_health(chip_data.get('chip_health', 'N/A'), report_language) }}
 {% elif chip_unavailable_reason %}
 **{{ labels.chip_label }}**: {{ chip_unavailable_reason }}
+{% endif %}
+{% if data_persp.get('chip_source_note') %}
+{{ data_persp.get('chip_source_note') }}
 {% endif %}
 {% endif %}
 
@@ -251,7 +261,12 @@
 {% endfor %}
 {% endif %}
 
-*{{ labels.generated_at_label }}：{{ report_timestamp }}*
+*{{ data_as_of_line }}*
 {% if show_llm_model and models_used %}
 *{{ labels.analysis_model_label }}：{{ models_used|join(', ') }}*
+{% endif %}
+*{{ accuracy_line }}*
+{% if report_disclaimer_enabled %}
+
+*{{ disclaimer_line }}*
 {% endif %}

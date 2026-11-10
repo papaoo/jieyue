@@ -86,6 +86,45 @@ WEB_SETTINGS_HIDDEN_FROM_UI = {
 }
 
 _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
+    "FREE_MODEL_ENABLED": {
+        "title": "免费模型通道", "description": "启用后统一使用免费模型；关闭恢复原模型配置，失败不自动转付费。",
+        "category": "ai_model", "data_type": "boolean", "ui_control": "switch",
+        "is_sensitive": False, "is_required": False, "is_editable": True,
+        "default_value": "false", "display_order": 1,
+    },
+    "FREE_MODEL_NAME": {
+        "title": "免费默认模型", "description": "实际调用前核对上游目录与零价格。",
+        "category": "ai_model", "data_type": "string", "ui_control": "select",
+        "is_sensitive": False, "is_required": False, "is_editable": True,
+        "default_value": "deepseek-v4.1-flash-free", "display_order": 2,
+        "options": [{"label": "DeepSeek V4.1 Flash", "value": "deepseek-v4.1-flash-free"},
+                    {"label": "MiMo V2.6 Flash", "value": "mimo-v2.6-flash-free"}],
+        "validation": {"enum": ["deepseek-v4.1-flash-free", "mimo-v2.6-flash-free"]},
+    },
+    "FREE_MODEL_DAILY_REQUESTS": {
+        "title": "免费通道每日请求上限", "description": "阶跃自身的保护额度，含测试、Agent 每轮调用及失败请求，不是上游承诺。北京时间每日重置。",
+        "category": "ai_model", "data_type": "integer", "ui_control": "number",
+        "is_sensitive": False, "is_required": False, "is_editable": True,
+        "default_value": "100", "validation": {"min": 1, "max": 1000}, "display_order": 3,
+    },
+    "FREE_MODEL_MAX_TOKENS": {
+        "title": "免费模型单次输出上限", "description": "每次最多允许输出的 token 数。",
+        "category": "ai_model", "data_type": "integer", "ui_control": "number",
+        "is_sensitive": False, "is_required": False, "is_editable": True,
+        "default_value": "8192", "validation": {"min": 512, "max": 16384}, "display_order": 4,
+    },
+    "FREE_MODEL_TIMEOUT_SECONDS": {
+        "title": "免费模型超时（秒）", "description": "单次请求的最长等待时间。",
+        "category": "ai_model", "data_type": "integer", "ui_control": "number",
+        "is_sensitive": False, "is_required": False, "is_editable": True,
+        "default_value": "90", "validation": {"min": 10, "max": 180}, "display_order": 5,
+    },
+    "FREE_MODEL_PROXY_URL": {
+        "title": "免费模型独立代理", "description": "可选 HTTP/HTTPS 代理地址，仅用于免费模型目录和调用。留空直连，不继承系统代理。",
+        "category": "ai_model", "data_type": "string", "ui_control": "password",
+        "is_sensitive": True, "is_required": False, "is_editable": True,
+        "default_value": "", "display_order": 6,
+    },
     "STOCK_LIST": {
         "title": "Stock List",
         "description": "Watchlist stock codes. English commas are recommended; common pasted separators are normalized on save.",
@@ -875,10 +914,24 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "is_sensitive": False,
         "is_required": False,
         "is_editable": True,
-        "default_value": "100",
+        "default_value": "5",
         "options": [],
         "validation": {"min": 1, "max": 500},
         "display_order": 19,
+    },
+    "TICKFLOW_MAX_SYMBOLS_PER_REQUEST": {
+        "title": "TickFlow Symbols Per Request",
+        "description": "Plan-specific symbol limit. Defaults to 5 for the free tier; caps saved batch sizes as well.",
+        "category": "data_source", "data_type": "integer", "ui_control": "number",
+        "is_sensitive": False, "is_required": False, "is_editable": True,
+        "default_value": "5", "options": [], "validation": {"min": 1, "max": 500}, "display_order": 22,
+    },
+    "TICKFLOW_REQUESTS_PER_MINUTE": {
+        "title": "TickFlow Requests Per Minute",
+        "description": "Shared in-process rolling budget per API key. Defaults to 10; exhausted budgets use fallback without sleeping.",
+        "category": "data_source", "data_type": "integer", "ui_control": "number",
+        "is_sensitive": False, "is_required": False, "is_editable": True,
+        "default_value": "10", "options": [], "validation": {"min": 1, "max": 100000}, "display_order": 23,
     },
     "FUTU_OPEND_HOST": {
         "title": "Futu OpenD Host",
@@ -4789,8 +4842,16 @@ _FIELD_HELP_METADATA: Dict[str, Dict[str, Any]] = {
     },
     "TICKFLOW_BATCH_SIZE": {
         "help_key": "settings.data_source.TICKFLOW_BATCH_SIZE",
-        "examples": ["TICKFLOW_BATCH_SIZE=100"],
+        "examples": ["TICKFLOW_BATCH_SIZE=5"],
         "docs": _DOC_FULL_GUIDE_DATA_SOURCE,
+    },
+    "TICKFLOW_MAX_SYMBOLS_PER_REQUEST": {
+        "help_key": "settings.data_source.TICKFLOW_MAX_SYMBOLS_PER_REQUEST",
+        "examples": ["TICKFLOW_MAX_SYMBOLS_PER_REQUEST=5"], "docs": _DOC_FULL_GUIDE_DATA_SOURCE,
+    },
+    "TICKFLOW_REQUESTS_PER_MINUTE": {
+        "help_key": "settings.data_source.TICKFLOW_REQUESTS_PER_MINUTE",
+        "examples": ["TICKFLOW_REQUESTS_PER_MINUTE=10"], "docs": _DOC_FULL_GUIDE_DATA_SOURCE,
     },
     "SERPAPI_API_KEYS": {
         "help_key": "settings.data_source.search_api_keys",

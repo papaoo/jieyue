@@ -1,3 +1,4 @@
+import { BRAND } from '../config/brand';
 import type { SystemConfigCategory } from '../types/systemConfig';
 import type { UiLanguage } from '../i18n/uiText';
 
@@ -67,6 +68,8 @@ const fieldTitleMap: Record<string, string> = {
   TICKFLOW_KLINE_ADJUST: 'TickFlow 日 K 复权模式',
   TICKFLOW_BATCH_DAILY_ENABLED: 'TickFlow 批量日 K 预取',
   TICKFLOW_BATCH_SIZE: 'TickFlow 批量大小',
+  TICKFLOW_MAX_SYMBOLS_PER_REQUEST: 'TickFlow 每次标的上限',
+  TICKFLOW_REQUESTS_PER_MINUTE: 'TickFlow 每分钟请求预算',
   ENABLE_REALTIME_QUOTE: '启用实时行情',
   ENABLE_REALTIME_TECHNICAL_INDICATORS: '盘中实时技术面',
   ENABLE_CHIP_DISTRIBUTION: '启用筹码分布分析',
@@ -237,6 +240,8 @@ const fieldDescriptionMap: Record<string, string> = {
   TICKFLOW_KLINE_ADJUST: '控制 TickFlow 日 K 线的复权口径，默认 none 保持未复权技术指标基线。',
   TICKFLOW_BATCH_DAILY_ENABLED: '批量分析前是否使用 TickFlow 批量日 K 接口预热缓存；权限不足时会继续回退。',
   TICKFLOW_BATCH_SIZE: '控制 TickFlow 日 K 和实时行情批量请求的单批最大标的数。',
+  TICKFLOW_MAX_SYMBOLS_PER_REQUEST: '按套餐限制拆批，默认 5；即使已保存批量 100 也会受此上限约束。',
+  TICKFLOW_REQUESTS_PER_MINUTE: '同一进程按 Key 共享滚动请求预算，默认 10；超额立即走备用源，不阻塞等待。',
   ENABLE_REALTIME_QUOTE: '控制是否启用实时行情数据获取。',
   ENABLE_REALTIME_TECHNICAL_INDICATORS: '盘中分析时用实时价计算 MA5/MA10/MA20 与多头排列（Issue #234）；关闭则用昨日收盘。',
   ENABLE_CHIP_DISTRIBUTION: '控制是否启用筹码分布分析；关闭后可减少外部请求和失败噪音。',
@@ -358,7 +363,7 @@ const fieldDescriptionMap: Record<string, string> = {
   WEBUI_AUTO_BUILD: '后端启动 WebUI 前是否自动检查并构建前端静态产物；关闭前需确认产物已预构建，保存后需重启生效。',
   WEBUI_PORT: 'Web 页面服务监听端口。',
   AGENT_MODE: '是否启用 ReAct Agent 策略问股。对外文案仍叫“策略”，内部配置字段统一使用 skill。',
-  AGENT_BACKEND: '选择问股 Chat 使用当前默认模型配置，还是调用运行 DSA 设备上的 Codex。自动（推荐）始终保持默认模型配置，不会自动启用实验能力。',
+  AGENT_BACKEND: `选择问股 Chat 使用当前默认模型配置，还是调用运行 ${BRAND.name} 设备上的 Codex。自动（推荐）始终保持默认模型配置，不会自动启用实验能力。`,
   AGENT_GENERATION_BACKEND: '用于问股助手生成回复并调用行情、新闻和历史数据工具。通常保持“自动”，系统会选择当前可用的方式。',
   AGENT_MAX_STEPS: '默认模型配置的 Agent 最大推理步数；选择 Codex 时，用作单次问股的最大工具调用次数。',
   AGENT_SKILLS: '逗号分隔的交易策略列表。留空时使用 metadata 里声明的主默认策略 skill（内置默认是 bull_trend）；也可填写 all 启用全部策略。',

@@ -687,6 +687,12 @@ class LLMToolAdapter:
     ) -> LLMResponse:
         """Call a specific litellm model with OpenAI-format messages and tools."""
         openai_messages = self._convert_messages(messages, target_model=model)
+        from src.llm.free_models import enabled as free_enabled, completion as free_completion
+        if free_enabled(self._config):
+            response = free_completion(self._config, model=model, messages=openai_messages,
+                                       tools=tools, max_tokens=max_tokens, timeout=timeout)
+            return self._parse_litellm_response(response, model, openai_messages,
+                                               model_list=self._config.llm_model_list)
 
         # Use short model name (without provider prefix) for thinking model lookup
         model_short = model.split("/")[-1] if "/" in model else model

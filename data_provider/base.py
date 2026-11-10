@@ -14,9 +14,12 @@
 3. 指数退避重试机制
 """
 
+import copy
 import logging
 import random
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from threading import BoundedSemaphore, RLock, Thread
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
@@ -40,6 +43,113 @@ logger = logging.getLogger(__name__)
 # === 标准化列名定义 ===
 STANDARD_COLUMNS = ['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg']
 
+# === 复权口径登记表 ===
+# 背景：fallback 链上不同源的复权基准不同（qfq / 不复权），同一股票的历史行
+# 可能混合两种基准，除权日附近指标与回撤收益完全错误且无法从数据层检测。
+# 机制：每个 fetcher 通过类属性 ``price_adjustment`` 声明日线复权口径；
+# DataFetcherManager 在（重）建索引时把 name -> 口径登记到本表；
+# 落库时写入 ``stock_daily.price_adjustment``，读取侧据此检测混用。
+# 取值：qfq=前复权 / hfq=后复权 / none=确定不复权 / unknown=未声明（按未知处理，不落值）。
+VALID_PRICE_ADJUSTMENTS = ("qfq", "hfq", "none", "unknown")
+
+_FETCHER_PRICE_ADJUSTMENT_REGISTRY: Dict[str, str] = {}
+_FETCHER_ADJUSTMENT_REGISTRY_LOCK = RLock()
+# 类属性回退缓存：registry 未登记时按 fetcher 类声明解析（单一真源在实现旁边）
+_FETCHER_CLASS_ADJUSTMENT_CACHE: Dict[str, Optional[str]] = {}
+
+# 可能声明 price_adjustment 的 fetcher 模块（回退查找用，失败静默跳过）
+_ADJUSTMENT_FETCHER_MODULES = (
+    "efinance_fetcher",
+    "akshare_fetcher",
+    "baostock_fetcher",
+    "tencent_fetcher",
+    "longbridge_fetcher",
+    "yfinance_fetcher",
+    "tushare_fetcher",
+    "futu_fetcher",
+    "pytdx_fetcher",
+    "tickflow_fetcher",
+    "finnhub_fetcher",
+    "alphavantage_fetcher",
+)
+
+
+def register_fetcher_price_adjustment(fetcher_name: str, adjustment: str) -> None:
+    """Register a fetcher's daily price-adjustment mode (idempotent).
+
+    Called by ``DataFetcherManager`` when it (re)builds its fetcher index; the
+    instance-level value wins over the class attribute so config-driven modes
+    (e.g. TickFlow's ``kline_adjust``) are recorded faithfully.
+    """
+    key = str(fetcher_name or "").strip()
+    value = str(adjustment or "").strip().lower()
+    if not key or value not in VALID_PRICE_ADJUSTMENTS:
+        return
+    with _FETCHER_ADJUSTMENT_REGISTRY_LOCK:
+        _FETCHER_PRICE_ADJUSTMENT_REGISTRY[key] = value
+
+
+def _lookup_fetcher_class_price_adjustment(fetcher_name: str) -> Optional[str]:
+    """Resolve ``price_adjustment`` from the fetcher class declaration.
+
+    Keeps the source of truth next to each fetcher implementation and makes the
+    lookup work even when no ``DataFetcherManager`` has been instantiated in this
+    process (e.g. direct API writes). Unavailable modules are skipped silently.
+    """
+    from importlib import import_module
+
+    for module_name in _ADJUSTMENT_FETCHER_MODULES:
+        try:
+            module = import_module(f".{module_name}", __package__)
+        except Exception:  # pragma: no cover - optional deps / partial installs
+            continue
+        for attr in vars(module).values():
+            if not isinstance(attr, type):
+                continue
+            if getattr(attr, "name", None) != fetcher_name:
+                continue
+            mode = str(getattr(attr, "price_adjustment", "unknown") or "unknown").strip().lower()
+            return mode if mode in VALID_PRICE_ADJUSTMENTS and mode != "unknown" else None
+    return None
+
+
+def price_adjustment_for_source(source_name: Optional[str]) -> Optional[str]:
+    """Resolve the daily price-adjustment mode for a data-source name.
+
+    Lookup order: instance registry (manager) -> fetcher class declaration.
+    Returns ``qfq`` / ``hfq`` / ``none`` for declared sources and ``None`` for
+    unknown ones (unknown is not the same as ``none`` = unadjusted).
+    """
+    key = str(source_name or "").strip()
+    if not key:
+        return None
+    with _FETCHER_ADJUSTMENT_REGISTRY_LOCK:
+        value = _FETCHER_PRICE_ADJUSTMENT_REGISTRY.get(key)
+        if key in _FETCHER_CLASS_ADJUSTMENT_CACHE:
+            return _FETCHER_CLASS_ADJUSTMENT_CACHE[key]
+    if value in (None, "unknown"):
+        value = _lookup_fetcher_class_price_adjustment(key)
+    resolved = value if value in ("qfq", "hfq", "none") else None
+    with _FETCHER_ADJUSTMENT_REGISTRY_LOCK:
+        _FETCHER_CLASS_ADJUSTMENT_CACHE[key] = resolved
+    return resolved
+
+_SAFE_EXCEPTION_DETAILS = ContextVar("safe_provider_exception_details", default=False)
+
+
+@contextmanager
+def safe_exception_details(enabled: bool = False):
+    """Request-local fixed diagnostics; never alter other requests or log levels."""
+    token = _SAFE_EXCEPTION_DETAILS.set(bool(enabled) or _SAFE_EXCEPTION_DETAILS.get())
+    try:
+        yield _SAFE_EXCEPTION_DETAILS.get()
+    finally:
+        _SAFE_EXCEPTION_DETAILS.reset(token)
+
+
+def safe_exception_details_enabled() -> bool:
+    return _SAFE_EXCEPTION_DETAILS.get()
+
 
 def unwrap_exception(exc: Exception) -> Exception:
     """
@@ -62,6 +172,9 @@ def summarize_exception(exc: Exception) -> Tuple[str, str]:
     """
     Build a stable summary for logs while preserving the application-layer message.
     """
+    if _SAFE_EXCEPTION_DETAILS.get():
+        # Do not inspect/stringify upstream exception text in safe boundaries.
+        return "source_error", "source_request_failed"
     root = unwrap_exception(exc)
     error_type = type(root).__name__
     message = str(exc).strip() or str(root).strip() or error_type
@@ -360,6 +473,10 @@ class BaseFetcher(ABC):
     name: str = "BaseFetcher"
     priority: int = 99  # 优先级数字越小越优先
     allow_empty_daily_data: bool = False
+    # 日线行情复权口径：qfq=前复权 / none=确定不复权 / unknown=未声明。
+    # 子类按实际接口语义覆盖；落库到 stock_daily.price_adjustment，
+    # 用于检测同一标的历史行混用不同复权基准（除权日指标/收益错乱）。
+    price_adjustment: str = "unknown"
     
     @abstractmethod
     def _fetch_raw_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
@@ -731,6 +848,12 @@ class DataFetcherManager:
 
     def _refresh_fetcher_indexes_locked(self) -> None:
         self._fetchers_by_name = {fetcher.name: fetcher for fetcher in self._fetchers}
+        # 同步复权口径登记表：name -> fetcher.price_adjustment
+        for fetcher in self._fetchers:
+            register_fetcher_price_adjustment(
+                fetcher.name,
+                getattr(fetcher, "price_adjustment", "unknown"),
+            )
 
     def _get_fetcher_by_name(self, fetcher_name: str, capability: str = "") -> Optional[BaseFetcher]:
         self._ensure_concurrency_guards()
@@ -1518,7 +1641,9 @@ class DataFetcherManager:
                     api_key=api_key,
                     kline_adjust=getattr(config, "tickflow_kline_adjust", "none"),
                     batch_daily_enabled=getattr(config, "tickflow_batch_daily_enabled", True),
-                    batch_size=getattr(config, "tickflow_batch_size", 100),
+                    batch_size=getattr(config, "tickflow_batch_size", 5),
+                    max_symbols_per_request=getattr(config, "tickflow_max_symbols_per_request", 5),
+                    requests_per_minute=getattr(config, "tickflow_requests_per_minute", 10),
                     priority=getattr(config, "tickflow_priority", 2),
                 )
                 self._tickflow_fetcher = fetcher
@@ -1838,7 +1963,9 @@ class DataFetcherManager:
                     api_key=tickflow_api_key,
                     kline_adjust=getattr(config, "tickflow_kline_adjust", "none"),
                     batch_daily_enabled=getattr(config, "tickflow_batch_daily_enabled", True),
-                    batch_size=getattr(config, "tickflow_batch_size", 100),
+                    batch_size=getattr(config, "tickflow_batch_size", 5),
+                    max_symbols_per_request=getattr(config, "tickflow_max_symbols_per_request", 5),
+                    requests_per_minute=getattr(config, "tickflow_requests_per_minute", 10),
                     priority=getattr(config, "tickflow_priority", 2),
                 )
             )
@@ -2288,7 +2415,7 @@ class DataFetcherManager:
                         fetcher,
                         "prefetch_realtime_quotes",
                         stock_codes,
-                        batch_size=getattr(config, "tickflow_batch_size", 100),
+                        batch_size=getattr(config, "tickflow_batch_size", 5),
                     )
                     or 0
                 )
@@ -2913,7 +3040,7 @@ class DataFetcherManager:
         """Shortcut kept for backward-compat with A-share general loop."""
         return self._supplement_quote(stock_code, primary_quote, "LongbridgeFetcher")
 
-    def get_chip_distribution(self, stock_code: str):
+    def get_chip_distribution(self, stock_code: str, *, with_metadata: bool = False):
         """
         获取筹码分布数据（带熔断和多数据源降级）
 
@@ -2931,6 +3058,15 @@ class DataFetcherManager:
         """
         # Normalize code (strip SH/SZ prefix etc.)
         stock_code = normalize_stock_code(stock_code)
+        evidence = {"code": stock_code, "status": "unavailable", "attempts": [],
+                    "fetched_at": datetime.now(timezone.utc).isoformat(),
+                    "note": "筹码为估算成本分布，获利比例不是未来胜率；缺失不代表无风险。"}
+
+        def finish(chip, status):
+            evidence["status"] = status
+            if chip is not None:
+                evidence.update(source=chip.source, as_of=chip.date or None)
+            return (chip, evidence) if with_metadata else chip
 
         from .realtime_types import get_chip_circuit_breaker
         from src.config import get_config
@@ -2940,7 +3076,10 @@ class DataFetcherManager:
         # 如果筹码分布功能被禁用，直接返回 None
         if not config.enable_chip_distribution:
             logger.debug(f"[筹码分布] 功能已禁用，跳过 {stock_code}")
-            return None
+            return finish(None, "disabled")
+
+        if not (len(stock_code) == 6 and stock_code.isdigit() and stock_code[0] in '03689'):
+            return finish(None, "unsupported")
 
         circuit_breaker = get_chip_circuit_breaker()
 
@@ -2958,6 +3097,7 @@ class DataFetcherManager:
             # 检查熔断器状态
             if not circuit_breaker.is_available(source_key):
                 logger.debug(f"[熔断] {fetcher_name} 筹码接口处于熔断状态，尝试下一个")
+                evidence["attempts"].append({"source": fetcher_name, "status": "circuit_open"})
                 continue
 
             candidate_fetchers.append((fetcher, fetcher_name, source_key))
@@ -2975,9 +3115,32 @@ class DataFetcherManager:
                     provider=fetcher_name,
                     operation="get_chip_distribution",
                 )
-                chip = self._call_fetcher_method(fetcher, 'get_chip_distribution', stock_code)
+                def invoke(fetcher=fetcher):
+                    try:
+                        return self._call_fetcher_method(fetcher, 'get_chip_distribution', stock_code), None
+                    except Exception as exc:
+                        return None, exc
+                payload, timeout_error, _ = self._run_with_timeout(
+                    invoke, 8.0, f"{fetcher_name} chip",
+                    quarantine_key=(fetcher_name, "chip"),
+                )
+                if timeout_error:
+                    raise TimeoutError("chip provider timed out; fallback used")
+                chip, provider_error = payload
+                if provider_error is not None:
+                    raise provider_error
                 latency_ms = int((time.time() - attempt_start) * 1000)
                 if _is_meaningful_chip_distribution(chip):
+                    # Legacy consumers may inspect undated estimates, but metadata
+                    # never promotes them to verified current observations.
+                    observed = pd.to_datetime(getattr(chip, 'date', ''), errors='coerce')
+                    from src.core.trading_calendar import get_market_now
+                    today = get_market_now('cn').date()
+                    if not pd.isna(observed) and observed.date() > today:
+                        raise ValueError("chip provider returned a future business date")
+                    status = "date_unknown" if pd.isna(observed) else (
+                        "historical" if observed.date() < today else "available")
+                    evidence["attempts"].append({"source": fetcher_name, "status": status})
                     record_provider_run(
                         data_type="chip",
                         provider=fetcher_name,
@@ -2988,8 +3151,9 @@ class DataFetcherManager:
                     )
                     circuit_breaker.record_success(source_key)
                     logger.info(f"[筹码分布] {stock_code} 成功获取 (来源: {fetcher_name})")
-                    return chip
+                    return finish(chip, status)
                 else:
+                    evidence["attempts"].append({"source": fetcher_name, "status": "empty_or_incomplete"})
                     record_provider_run(
                         data_type="chip",
                         provider=fetcher_name,
@@ -3010,6 +3174,11 @@ class DataFetcherManager:
                     circuit_breaker.record_inconclusive(source_key)
             except Exception as e:
                 error_type, error_reason = summarize_exception(e)
+                status = ("no_permission" if isinstance(e, PermissionError) else
+                          "timeout" if isinstance(e, TimeoutError) else
+                          "invalid_data" if isinstance(e, ValueError) else "provider_error")
+                evidence["attempts"].append({"source": fetcher_name, "status": status,
+                                             "error_type": type(e).__name__})
                 record_provider_run(
                     data_type="chip",
                     provider=fetcher_name,
@@ -3025,7 +3194,7 @@ class DataFetcherManager:
                 continue
 
         logger.warning(f"[筹码分布] {stock_code} 所有数据源均失败")
-        return None
+        return finish(None, "unavailable")
 
     def get_stock_name(self, stock_code: str, allow_realtime: bool = True) -> Optional[str]:
         """
@@ -3102,7 +3271,7 @@ class DataFetcherManager:
                     logger.info(f"[股票名称] 从 {fetcher.name} 获取: {stock_code} -> {name}")
                     return name
             except Exception as e:
-                logger.debug(f"[股票名称] {fetcher.name} 获取失败: {e}")
+                logger.debug("[股票名称] %s 获取失败: %s", fetcher.name, summarize_exception(e)[1])
                 continue
 
         # 4. 所有数据源都失败
@@ -4259,9 +4428,133 @@ class DataFetcherManager:
         return self._build_market_not_supported(_market_tag(stock_code), reason)
 
     def get_fundamental_context(
+        self, stock_code: str, budget_seconds: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Use configured native facts before slow public-web fallbacks."""
+        from src.config import get_config
+        config = get_config()
+        code = normalize_stock_code(stock_code)
+        providers = [f for f in self._get_fetchers_snapshot()
+                     if callable(getattr(f, "get_fundamental_snapshot", None))]
+        if (not providers or not getattr(config, "tushare_token", "") or not config.enable_fundamental_pipeline
+                or _market_tag(code) != "cn" or _is_etf_code(code)
+                or config.fundamental_fetch_timeout_seconds <= 0):
+            return self._get_legacy_fundamental_context(code, budget_seconds)
+        budget = max(0.0, float(budget_seconds if budget_seconds is not None else config.fundamental_stage_timeout_seconds))
+        key = "native:" + str(self._get_fundamental_cache_key(code, budget))
+        ttl = max(0, config.fundamental_cache_ttl_seconds)
+        with self._fundamental_cache_lock:
+            cached = self._fundamental_cache.get(key)
+            if cached and ttl and time.time() - cached["ts"] <= ttl:
+                return copy.deepcopy(cached["context"])
+        started = time.monotonic()
+        # Native facts now include dividend, sector aggregation and five-session
+        # events. Reserve most of the unchanged total deadline for this richer
+        # authenticated path; slow web fallback still gets any unused time.
+        native_budget = budget * 0.9
+        completed = {}
+        completed_lock = RLock()
+
+        def retain_block(name, block):
+            with completed_lock:
+                completed[name] = copy.deepcopy(block)
+
+        native, error, _ = self._run_with_timeout(
+            lambda: providers[0].get_fundamental_snapshot(
+                code, budget_seconds=max(0, native_budget - 0.2), on_block=retain_block),
+            native_budget, "tushare_fundamental_snapshot",
+            quarantine_key=(providers[0].name, "fundamental_snapshot"),
+        )
+        with completed_lock:
+            native = native if isinstance(native, dict) else copy.deepcopy(completed)
+        blocks = ("valuation", "growth", "earnings", "institution", "capital_flow", "dragon_tiger", "boards")
+        missing = [name for name in blocks if native.get(name, {}).get("status") != "ok"]
+        fallback = {}
+        if missing:
+            fallback = self._get_legacy_fundamental_context(
+                code, max(0.0, budget-(time.monotonic()-started)), _required_blocks=set(missing))
+        context = {"market": "cn", "source_chain": [], "errors": [], "coverage": {}}
+        for name in blocks:
+            block = native.get(name, {})
+            if name in missing:
+                block = self._merge_native_fundamental_block(name, block, fallback.get(name, {}))
+            if not block:
+                block = self._build_fundamental_block("failed", {}, [], [error or "data unavailable"])
+            context[name] = block
+            context["coverage"][name] = block.get("status", "failed")
+            context["source_chain"].extend(block.get("source_chain", []))
+            context["errors"].extend(block.get("errors", []))
+        context["belong_boards"] = context["boards"].get("data", {}).get("belong_boards", [])
+        context["missing_fields"] = [name for name in blocks if context["coverage"][name] != "ok"]
+        context["status"] = "partial" if context["missing_fields"] else "ok"
+        context["elapsed_ms"] = int((time.monotonic()-started)*1000)
+        if ttl and any(self._has_meaningful_payload(context[n].get("data")) for n in blocks):
+            with self._fundamental_cache_lock:
+                self._fundamental_cache[key] = {"ts": time.time(), "context": copy.deepcopy(context)}
+            self._prune_fundamental_cache(ttl, max(0, int(getattr(config, "fundamental_cache_max_entries", 256))))
+        return context
+
+    @classmethod
+    def _merge_native_fundamental_block(cls, name, native, fallback):
+        """Supplement independent sections, never splice financial periods or price bases."""
+        if not fallback:
+            return native
+        original = native.get("data", {})
+        extra = fallback.get("data", {})
+        has_original = cls._has_meaningful_payload(original)
+        if name == "earnings":
+            report = original.get("financial_report") or {}
+            has_original = cls._earnings_block_has_values(original) or any(
+                report.get(key) is not None for key in ("operating_cash_flow", "roe"))
+        elif name == "growth":
+            has_original = any(original.get(k) is not None for k in ("roe", "revenue_yoy", "net_profit_yoy", "gross_margin"))
+        elif name == "valuation":
+            has_original = any(original.get(k) is not None for k in ("pe_ratio", "pb_ratio", "total_mv", "circ_mv", "dividend_yield_ttm_pct"))
+        if not has_original and cls._has_meaningful_payload(extra):
+            merged = copy.deepcopy(fallback)
+        else:
+            merged = copy.deepcopy(native)
+            data = merged.setdefault("data", {})
+            if name == "earnings":
+                report = data.get("financial_report") or {}
+                extra_report = extra.get("financial_report") or {}
+                fields = ("revenue", "net_profit_parent", "operating_cash_flow", "roe")
+                if not any(report.get(k) is not None for k in fields) and any(extra_report.get(k) is not None for k in fields):
+                    report = copy.deepcopy(extra_report)
+                    data["financial_report"] = report
+                elif (report.get("report_date") and report.get("report_date") == extra_report.get("report_date")
+                      and extra_report.get("currency") in (None, report.get("currency"))):
+                    for field in ("revenue", "net_profit_parent", "operating_cash_flow", "roe"):
+                        if report.get(field) is None and extra_report.get(field) is not None:
+                            report[field] = extra_report[field]
+                    data["financial_report"] = report
+                merged["missing_fields"] = [k for k in merged.get("missing_fields", []) if report.get(k) is None]
+            # These sections have separate contracts and can be supplemented
+            # without changing the native stock's dated observations.
+            sections = {"capital_flow": ("sector_rankings",), "boards": ("sector_rankings",),
+                        "earnings": ("dividend",)}.get(name, ())
+            supplied = []
+            for key in sections:
+                if not cls._has_meaningful_payload(data.get(key)) and cls._has_meaningful_payload(extra.get(key)):
+                    data[key] = copy.deepcopy(extra[key])
+                    supplied.append(key)
+            if supplied:
+                merged["missing_fields"] = [k for k in merged.get("missing_fields", []) if k not in supplied]
+                if not merged["missing_fields"]:
+                    merged["status"] = "ok"
+            # Keep alternate periods and definitions inspectable, not implicitly
+            # merged into the primary facts consumed by the LLM/risk engine.
+            if cls._has_meaningful_payload(extra):
+                merged["supplementary_data"] = copy.deepcopy(extra)
+        merged["source_chain"] = native.get("source_chain", []) + fallback.get("source_chain", [])
+        merged["errors"] = list(dict.fromkeys(native.get("errors", []) + fallback.get("errors", [])))
+        return merged
+
+    def _get_legacy_fundamental_context(
         self,
         stock_code: str,
-        budget_seconds: Optional[float] = None
+        budget_seconds: Optional[float] = None,
+        *, _required_blocks: Optional[set] = None,
     ) -> Dict[str, Any]:
         """
         Aggregate fundamental blocks with fail-open semantics.
@@ -4295,6 +4588,8 @@ class DataFetcherManager:
         cache_ttl = int(config.fundamental_cache_ttl_seconds)
         cache_max_entries = max(0, int(getattr(config, "fundamental_cache_max_entries", 256)))
         cache_key = self._get_fundamental_cache_key(stock_code, stage_timeout)
+        if _required_blocks is not None:
+            cache_key += "|blocks=" + ",".join(sorted(_required_blocks))
         if cache_ttl > 0:
             self._prune_fundamental_cache(cache_ttl, cache_max_entries)
             with self._fundamental_cache_lock:
@@ -4326,6 +4621,8 @@ class DataFetcherManager:
             remaining_seconds = max(0.0, remaining_seconds - consumed_ms / 1000.0)
 
         valuation_timeout = min(fetch_timeout, remaining_seconds)
+        if _required_blocks is not None and "valuation" not in _required_blocks:
+            valuation_timeout = 0
         if valuation_timeout > 0:
             quote_payload, valuation_err, valuation_ms = self._run_with_retry(
                 lambda: self.get_realtime_quote(stock_code),
@@ -4361,7 +4658,7 @@ class DataFetcherManager:
         )
 
         # growth / earnings / institution (one AkShare call)
-        if remaining_seconds <= 0:
+        if remaining_seconds <= 0 or (_required_blocks is not None and not _required_blocks.intersection({"growth", "earnings", "institution"})):
             bundle_status = "failed"
             bundle_payload: Dict[str, Any] = {}
             bundle_errors = ["fundamental stage timeout"]
@@ -4434,7 +4731,8 @@ class DataFetcherManager:
                     latest_price = float(latest_price_raw)
                 except (TypeError, ValueError):
                     latest_price = None
-            ttm_yield = None
+            # A missing reference price must not erase a provider-supplied yield.
+            ttm_yield = dividend_payload.get("ttm_dividend_yield_pct")
             if ttm_cash is not None:
                 if latest_price is not None and latest_price > 0:
                     ttm_yield = round(ttm_cash / latest_price * 100.0, 4)
@@ -4498,7 +4796,7 @@ class DataFetcherManager:
             )
             result_ctx["status"] = "partial"
         else:
-            capital_flow_budget = min(fetch_timeout, remaining_seconds)
+            capital_flow_budget = min(fetch_timeout, remaining_seconds) if _required_blocks is None or "capital_flow" in _required_blocks else 0
             capital_flow_start = time.time()
             result_ctx["capital_flow"] = self.get_capital_flow_context(
                 stock_code,
@@ -4506,7 +4804,7 @@ class DataFetcherManager:
             )
             _consume_budget(int((time.time() - capital_flow_start) * 1000))
 
-            dragon_tiger_budget = min(fetch_timeout, remaining_seconds)
+            dragon_tiger_budget = min(fetch_timeout, remaining_seconds) if _required_blocks is None or "dragon_tiger" in _required_blocks else 0
             dragon_tiger_start = time.time()
             result_ctx["dragon_tiger"] = self.get_dragon_tiger_context(
                 stock_code,
@@ -4516,7 +4814,7 @@ class DataFetcherManager:
 
             result_ctx["boards"] = self.get_board_context(
                 stock_code,
-                budget_seconds=min(fetch_timeout, remaining_seconds),
+                budget_seconds=min(fetch_timeout, remaining_seconds) if _required_blocks is None or "boards" in _required_blocks else 0,
             )
 
         block_statuses = {
@@ -4907,9 +5205,21 @@ class DataFetcherManager:
 
             top: List[Dict] = []
             bottom: List[Dict] = []
-            for fetcher in self._get_fetchers_snapshot():
+            fetchers = self._get_fetchers_snapshot()
+            # The cheap independent route must get a chance before a slow EM
+            # request consumes the caller's ranking timeout budget.
+            routes = [(fetcher, 'get_sina_concept_rankings') for fetcher in fetchers
+                      if callable(getattr(fetcher, 'get_sina_concept_rankings', None))]
+            routes += [(fetcher, 'get_concept_rankings') for fetcher in fetchers]
+            for fetcher, method in routes:
                 try:
-                    data = fetcher.get_concept_rankings(normalized_n)
+                    data, error, _ = self._run_with_timeout(
+                        lambda f=fetcher, m=method: self._call_fetcher_method(f, m, normalized_n),
+                        6.0, f"{fetcher.name} concept rankings",
+                        quarantine_key=(fetcher.name, method),
+                    )
+                    if error:
+                        raise TimeoutError("concept provider unavailable or timed out")
                     if data and (data[0] or data[1]):
                         top = data[0] or []
                         bottom = data[1] or []
@@ -4923,6 +5233,15 @@ class DataFetcherManager:
 
             if not top and not bottom and last_error:
                 logger.warning(f"[概念排行] 所有数据源均失败，最终错误: {last_error}")
+
+            # Retain the last successful snapshot for one day; preserve its
+            # original acquisition date and label it historical, never fresh.
+            if not top and not bottom and cached and cached[0] > now - 86400:
+                for target, previous in ((top, cached[1]), (bottom, cached[2])):
+                    for row in self._copy_ranking_rows(previous):
+                        row['definition'] = str(row.get('definition') or '') + '；接口失败，最近有效缓存，仅供背景参考'
+                        target.append(row)
+                return top, bottom
 
             ttl = (
                 self.__class__._CONCEPT_RANKINGS_CACHE_TTL_SECONDS

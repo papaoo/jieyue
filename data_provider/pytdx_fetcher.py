@@ -115,6 +115,7 @@ class PytdxFetcher(BaseFetcher):
     """
     
     name = "PytdxFetcher"
+    price_adjustment = "none"  # 日线为原始未复权价
     priority = int(os.getenv("PYTDX_PRIORITY", "2"))
     
     # 默认通达信行情服务器列表

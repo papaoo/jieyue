@@ -81,7 +81,7 @@ DSA_SCREENING_HOTSPOT_CONNECTIVITY_ERROR_MARKERS = (
 )
 _DSA_FETCHER_MANAGER_LOCK = threading.RLock()
 _DSA_FETCHER_MANAGER: Any = None
-_FUNDAMENTAL_BLOCKS = ("valuation", "growth", "earnings", "institution", "capital_flow", "boards")
+_FUNDAMENTAL_BLOCKS = ("valuation", "growth", "earnings", "institution", "capital_flow", "boards", "dragon_tiger")
 _SCREENING_LITELLM_COMPLETION_ROUTES: ContextVar[Optional[Tuple[Dict[str, Any], ...]]] = ContextVar(
     "screening_litellm_completion_routes",
     default=None,
@@ -1835,6 +1835,12 @@ def _build_screening_dsa_daily_history_fetcher() -> Optional[Callable[..., Any]]
             dsa_df, dsa_source = get_dsa_daily_history(code, lookback_days=lookback_days)
             normalized = _normalize_dsa_daily_history(dsa_df)
             if normalized is not None and not normalized.empty:
+                # The host Tushare/DB path can contain raw closes. Do not let a
+                # successful fetch bypass the native adjusted-history path.
+                if str(code).isdigit() and len(str(code)) == 6 and dsa_source in {"AkshareFetcher", "EfinanceFetcher", "BaostockFetcher"}:
+                    normalized.attrs.setdefault("price_adjustment", "forward")
+                if str(code).isdigit() and len(str(code)) == 6 and normalized.attrs.get("price_adjustment") != "forward":
+                    raise ValueError("daily price adjustment unverified; request adjusted history")
                 resolved_source = f"dsa:{dsa_source}"
                 normalized_code = code
                 normalize_code = getattr(daily_module, "_normalize_daily_code", None)
@@ -3431,7 +3437,9 @@ def get_dsa_realtime_quote(stock_code: str) -> Dict[str, Any]:
 
 def get_dsa_fundamental_context(stock_code: str) -> Dict[str, Any]:
     manager = _get_dsa_fetcher_manager()
-    context = manager.get_fundamental_context(stock_code, budget_seconds=4.0)
+    # Use the configured stage budget; a hard-coded 4s starved all blocks
+    # after the first slow public endpoint.
+    context = manager.get_fundamental_context(stock_code)
     return _compact_fundamental_context(_remove_non_finite_json_values(_to_plain(context)))
 
 
@@ -3475,6 +3483,9 @@ def _normalize_dsa_search_response(response: Any, *, max_results: int) -> Dict[s
                 # Preserve upstream fetch time; normalization may read cached
                 # results and must not mark them as retrieved just now.
                 "retrieved_at": getattr(item, "retrieved_at", None),
+                "relevance_score": getattr(item, "relevance_score", None),
+                "relevance_category": getattr(item, "relevance_category", None),
+                "relevance_reasons": getattr(item, "relevance_reasons", None),
             }
         )
     return _remove_non_finite_json_values(
@@ -3684,6 +3695,12 @@ def _build_dsa_candidate_context(
             warnings.append(f"fundamental_context_failed: {exc}")
             fundamentals = {}
 
+    if include_fundamentals:
+        coverage = fundamentals.get("coverage", {})
+        gaps = [key for key in _FUNDAMENTAL_BLOCKS if coverage.get(key) not in {"ok", "available"}]
+        if gaps:
+            warnings.append("fundamental_data_incomplete: " + ", ".join(gaps))
+
     if include_news:
         if not _has_recent_dsa_evidence(news):
             try:
@@ -3763,6 +3780,12 @@ def _compact_fundamental_context(context: Any) -> Dict[str, Any]:
             compact[block] = {
                 "status": payload.get("status"),
                 "data": payload.get("data") if isinstance(payload.get("data"), dict) else {},
+                "source_chain": payload.get("source_chain", []),
+                "source": payload.get("source"),
+                "fetched_at": payload.get("fetched_at"),
+                "missing_fields": payload.get("missing_fields", []),
+                "errors": payload.get("errors", []),
+                "supplementary_data": payload.get("supplementary_data", {}),
             }
     errors = context.get("errors")
     if isinstance(errors, list) and errors:
@@ -3788,7 +3811,7 @@ def _build_dsa_analysis_summary(
 
     coverage = fundamentals.get("coverage") if isinstance(fundamentals, dict) else {}
     if isinstance(coverage, dict) and coverage:
-        available_blocks = [key for key, value in coverage.items() if str(value).lower() in {"available", "partial"}]
+        available_blocks = [key for key, value in coverage.items() if str(value).lower() in {"ok", "available", "partial"}]
         if available_blocks:
             parts.append(f"DSA基本面覆盖：{', '.join(available_blocks[:4])}")
 
@@ -4099,7 +4122,7 @@ def _attach_candidate_explanations(
             (
                 item
                 for item in news_items
-                if _is_usable_timing_evidence(item)
+                if _is_usable_timing_evidence(item) and item.get("relevance_category") in (None, "", "direct_company_news")
             ),
             None,
         )
@@ -4119,7 +4142,7 @@ def _attach_candidate_explanations(
             (
                 item
                 for item in event_items
-                if _is_usable_timing_evidence(item)
+                if _is_usable_timing_evidence(item) and item.get("relevance_category") in (None, "", "direct_company_news")
             ),
             None,
         )

@@ -1,4 +1,5 @@
 import apiClient from './index';
+import { BRAND } from '../config/brand';
 import { createParsedApiError, getParsedApiError, type ParsedApiError } from './error';
 import { toCamelCase } from './utils';
 import type {
@@ -120,8 +121,8 @@ function toSnakeNotificationTestPayload(payload: TestNotificationChannelRequest)
       value: item.value,
     })),
     mask_token: payload.maskToken ?? '******',
-    title: payload.title ?? 'DSA 通知测试',
-    content: payload.content ?? '这是一条来自 DSA Web 设置页的通知测试消息。',
+    title: payload.title ?? `${BRAND.name} 通知测试`,
+    content: payload.content ?? `这是一条来自 ${BRAND.name} Web 设置页的通知测试消息。`,
     timeout_seconds: payload.timeoutSeconds ?? 20,
   };
 }

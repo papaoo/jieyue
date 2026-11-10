@@ -105,7 +105,9 @@ export const Input = ({
         onPasswordVisibleChange?.(nextVisible);
       }}
       aria-label={visible ? t('common.hideContent') : t('common.showContent')}
-      tabIndex={-1}
+      tabIndex={isLoginAppearance ? 0 : -1}
+      disabled={isLoginAppearance ? props.disabled : undefined}
+      aria-pressed={isLoginAppearance ? visible : undefined}
     >
       <EyeToggleIcon visible={visible} />
     </button>

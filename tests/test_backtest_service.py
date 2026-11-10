@@ -239,7 +239,7 @@ class BacktestServiceTestCase(unittest.TestCase):
         analysis_history_id: int,
         analysis_date: date,
         eval_window_days: int = 1,
-        engine_version: str = "v1",
+        engine_version: str = "v2",
     ) -> BacktestResult:
         return BacktestResult(
             analysis_history_id=analysis_history_id,
@@ -276,7 +276,7 @@ class BacktestServiceTestCase(unittest.TestCase):
             min_age_days=0,
             limit=10,
             eval_window_days=1,
-            engine_version="v1",
+            engine_version="v2",
             force=True,
         )
 
@@ -301,7 +301,7 @@ class BacktestServiceTestCase(unittest.TestCase):
             min_age_days=0,
             limit=10,
             eval_window_days=1,
-            engine_version="v1",
+            engine_version="v2",
             force=True,
         )
 
@@ -437,7 +437,7 @@ class BacktestServiceTestCase(unittest.TestCase):
             min_age_days=0,
             limit=10,
             eval_window_days=1,
-            engine_version="v1",
+            engine_version="v2",
             force=True,
         )
         stats = BacktestService(self.db).run_backtest(
@@ -845,7 +845,7 @@ class BacktestServiceTestCase(unittest.TestCase):
             min_age_days=0,
             limit=10,
             eval_window_days=3,
-            engine_version="v1",
+            engine_version="v2",
             force=True,
         )
 
@@ -860,7 +860,7 @@ class BacktestServiceTestCase(unittest.TestCase):
                     min_age_days=0,
                     limit=10,
                     eval_window_days=3,
-                    engine_version="v1",
+                    engine_version="v2",
                     force=True,
                 )
                 self.assertEqual(matches, [])
@@ -1790,7 +1790,7 @@ class BacktestServiceTestCase(unittest.TestCase):
                         code="AAPL",
                         analysis_date=date(2024, 1, 10),
                         eval_window_days=1,
-                        engine_version="v1",
+                        engine_version="v2",
                         eval_status="completed",
                         evaluated_at=datetime(2024, 1, 20, 0, 0, 0),
                         operation_advice="买入",
@@ -1808,7 +1808,7 @@ class BacktestServiceTestCase(unittest.TestCase):
                         code="AAPL.US",
                         analysis_date=date(2024, 1, 11),
                         eval_window_days=1,
-                        engine_version="v1",
+                        engine_version="v2",
                         eval_status="completed",
                         evaluated_at=datetime(2024, 1, 21, 0, 0, 0),
                         operation_advice="买入",
@@ -2244,7 +2244,7 @@ class BacktestServiceTestCase(unittest.TestCase):
                     code="000005",
                     analysis_date=date(2024, 1, 5),
                     eval_window_days=1,
-                    engine_version="v1",
+                    engine_version="v2",
                     eval_status="completed",
                     evaluated_at=datetime(2024, 1, 8, 0, 0, 0),
                     operation_advice="买入",
@@ -2329,7 +2329,7 @@ class BacktestServiceTestCase(unittest.TestCase):
                     code="000006",
                     analysis_date=date(2024, 1, 5),
                     eval_window_days=1,
-                    engine_version="v1",
+                    engine_version="v2",
                     eval_status="completed",
                     evaluated_at=datetime(2024, 1, 8, 0, 0, 0),
                     operation_advice="买入",
@@ -2509,6 +2509,7 @@ class BacktestServiceTestCase(unittest.TestCase):
         # Prices
         self.assertAlmostEqual(result.start_price, 100.0)
         self.assertAlmostEqual(result.end_close, 107.0)
+        # 决策点度量：方向命中仍以信号当日收盘价为基准（预测从决策点做出）
         self.assertAlmostEqual(result.stock_return_pct, 7.0)
 
         # Direction & outcome
@@ -2523,10 +2524,13 @@ class BacktestServiceTestCase(unittest.TestCase):
         self.assertEqual(result.first_hit_date, date(2024, 1, 2))
 
         # Simulated execution
-        self.assertAlmostEqual(result.simulated_entry_price, 100.0)
+        # v2：模拟成交使用"信号次日"的可成交价（该 fixture 的前向 bar 没有 open，
+        # 退化为次日收盘 105），并扣除双边成本（买入 8bp + 卖出 13bp）。
+        self.assertAlmostEqual(result.simulated_entry_price, 105.0)
         self.assertAlmostEqual(result.simulated_exit_price, 110.0)
         self.assertEqual(result.simulated_exit_reason, "take_profit")
-        self.assertAlmostEqual(result.simulated_return_pct, 10.0)
+        expected_net = (110 * (1 - 0.0013) - 105 * (1 + 0.0008)) / (105 * (1 + 0.0008)) * 100
+        self.assertAlmostEqual(result.simulated_return_pct, expected_net, places=4)
 
     def test_summaries_created_after_run(self) -> None:
         """Verify both overall and per-stock BacktestSummary rows are created."""
@@ -2580,7 +2584,14 @@ class BacktestServiceTestCase(unittest.TestCase):
         self.assertEqual(global_summary["total_evaluations"], 1)
         self.assertAlmostEqual(global_summary["win_rate"], 1.0)
         self.assertAlmostEqual(global_summary["direction_accuracy"], 1.0)
-        self.assertAlmostEqual(global_summary["avg_return"], 0.10)
+        # v2：avg_return 来自"次日入场 + 双边成本"的模拟损益（约 4.54%），
+        # 不再是按信号当日收盘价成交的裸价差（10%）。
+        expected_net_return = (
+            (110 * (1 - 0.0013) - 105 * (1 + 0.0008)) / (105 * (1 + 0.0008)) * 100
+        )
+        self.assertAlmostEqual(
+            global_summary["avg_return"], expected_net_return / 100, places=6
+        )
 
         self.assertIsNotNone(stock_summary)
         self.assertEqual(stock_summary["code"], "600519")
@@ -2745,7 +2756,7 @@ class BacktestServiceTestCase(unittest.TestCase):
             base_result = session.query(BacktestResult).filter(
                 BacktestResult.code == "600519",
                 BacktestResult.eval_window_days == 3,
-                BacktestResult.engine_version == "v1",
+                BacktestResult.engine_version == "v2",
             ).one()
             session.add_all([
                 BacktestResult(
@@ -2753,6 +2764,7 @@ class BacktestServiceTestCase(unittest.TestCase):
                     code=base_result.code,
                     analysis_date=base_result.analysis_date,
                     eval_window_days=1,
+                    # 另一个引擎版本 + 另一个窗口：都应被过滤掉
                     engine_version="v1",
                     eval_status="completed",
                     evaluated_at=datetime(2024, 1, 5, 0, 0, 0),
@@ -2771,7 +2783,8 @@ class BacktestServiceTestCase(unittest.TestCase):
                     code=base_result.code,
                     analysis_date=base_result.analysis_date,
                     eval_window_days=3,
-                    engine_version="v2",
+                    # 同窗口但引擎版本不同：应被 engine_version 过滤掉
+                    engine_version="v1",
                     eval_status="completed",
                     evaluated_at=datetime(2024, 1, 6, 0, 0, 0),
                     operation_advice="买入",
@@ -2790,7 +2803,7 @@ class BacktestServiceTestCase(unittest.TestCase):
         rows = service.repo.list_results(
             code="600519",
             eval_window_days=3,
-            engine_version="v1",
+            engine_version="v2",
             analysis_date_from=date(2024, 1, 1),
             analysis_date_to=date(2024, 1, 1),
         )
@@ -2806,15 +2819,16 @@ class BacktestServiceTestCase(unittest.TestCase):
         )
         self.assertEqual(evaluations["total"], 1)
         self.assertEqual(len(evaluations["items"]), 1)
-        self.assertEqual(evaluations["items"][0]["engine_version"], "v1")
+        self.assertEqual(evaluations["items"][0]["engine_version"], "v2")
         self.assertEqual(evaluations["items"][0]["operation_advice"], "买入")
         self.assertEqual(evaluations["items"][0]["action"], "buy")
         self.assertEqual(evaluations["items"][0]["action_label"], "买入")
         self.assertEqual(evaluations["items"][0]["position_recommendation"], "long")
 
         # Without explicit eval_window_days, summary infers the smallest
-        # window from matched rows (window=1 in this dataset) instead of
-        # falling back to the config default.
+        # window among matched rows instead of falling back to the config
+        # default. Matching is scoped to the current engine version (v2), so
+        # the window=1/v1 row above is not part of the candidate set.
         summary_inferred = service.get_summary(
             scope="stock",
             code="600519",
@@ -2823,13 +2837,14 @@ class BacktestServiceTestCase(unittest.TestCase):
         )
         self.assertIsNotNone(summary_inferred)
         assert summary_inferred is not None
-        self.assertEqual(summary_inferred["eval_window_days"], 1)
-        self.assertEqual(summary_inferred["engine_version"], "v1")
+        self.assertEqual(summary_inferred["eval_window_days"], 3)
+        self.assertEqual(summary_inferred["engine_version"], "v2")
         self.assertEqual(summary_inferred["total_evaluations"], 1)
         self.assertEqual(summary_inferred["completed_count"], 1)
-        self.assertEqual(summary_inferred["win_count"], 0)
-        self.assertEqual(summary_inferred["loss_count"], 1)
-        self.assertAlmostEqual(summary_inferred["direction_accuracy_pct"], 0.0)
+        # 命中的只有 v2 服务行（止盈命中、方向正确）；v1/window=1 的手工行不在范围内
+        self.assertEqual(summary_inferred["win_count"], 1)
+        self.assertEqual(summary_inferred["loss_count"], 0)
+        self.assertAlmostEqual(summary_inferred["direction_accuracy_pct"], 100.0)
 
         # With explicit eval_window_days=3, summary filters to that window only.
         summary_explicit = service.get_summary(
@@ -2842,7 +2857,7 @@ class BacktestServiceTestCase(unittest.TestCase):
         self.assertIsNotNone(summary_explicit)
         assert summary_explicit is not None
         self.assertEqual(summary_explicit["eval_window_days"], 3)
-        self.assertEqual(summary_explicit["engine_version"], "v1")
+        self.assertEqual(summary_explicit["engine_version"], "v2")
         self.assertEqual(summary_explicit["total_evaluations"], 1)
         self.assertEqual(summary_explicit["completed_count"], 1)
         self.assertEqual(summary_explicit["win_count"], 1)
@@ -2930,7 +2945,7 @@ class BacktestServiceTestCase(unittest.TestCase):
             base_result = session.query(BacktestResult).filter(
                 BacktestResult.code == "600519",
                 BacktestResult.eval_window_days == 3,
-                BacktestResult.engine_version == "v1",
+                BacktestResult.engine_version == "v2",
             ).one()
             session.add(
                 BacktestResult(
@@ -2938,7 +2953,7 @@ class BacktestServiceTestCase(unittest.TestCase):
                     code=base_result.code,
                     analysis_date=base_result.analysis_date,
                     eval_window_days=1,
-                    engine_version="v1",
+                    engine_version="v2",
                     eval_status="completed",
                     evaluated_at=datetime(2024, 1, 5, 0, 0, 0),
                     operation_advice="买入",

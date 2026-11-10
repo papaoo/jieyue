@@ -74,6 +74,11 @@ htmlcov/
 
 local/
 
+# Local agent notes and one-off review artifacts (not product source)
+/.planning/
+/.superpowers/
+/.workbuddy/
+
 run.sh
 
 verify_*.py

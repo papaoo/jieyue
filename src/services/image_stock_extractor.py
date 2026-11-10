@@ -336,7 +336,8 @@ def _call_litellm_vision(image_b64: str, mime_type: str, api_key: Optional[str] 
     if getattr(litellm, "completion", None) is None:
         import litellm as litellm_module
         litellm = litellm_module
-    response = litellm.completion(**call_kwargs)
+    from src.llm.free_models import enabled as free_enabled, completion as free_completion
+    response = free_completion(cfg, **call_kwargs) if free_enabled(cfg) else litellm.completion(**call_kwargs)
     if response and response.choices and response.choices[0].message.content:
         return response.choices[0].message.content
     raise ValueError("LiteLLM vision returned empty response")
@@ -378,8 +379,10 @@ def extract_stock_codes_from_image(
     model = _resolve_vision_model()
     keys = _get_api_keys_for_model(model, get_config())
 
+    from src.llm.free_models import enabled as free_enabled
+    max_attempts = 1 if free_enabled(get_config()) else 3
     last_error: Optional[Exception] = None
-    for attempt in range(3):
+    for attempt in range(max_attempts):
         try:
             key = random.choice(keys) if keys else None
             raw = _call_litellm_vision(image_b64, mime_type, api_key=key)
@@ -392,7 +395,7 @@ def extract_stock_codes_from_image(
             return items, raw
         except Exception as e:
             last_error = e
-            if attempt < 2:
+            if attempt < max_attempts - 1:
                 delay = 2 ** attempt
                 logger.warning(f"[ImageExtractor] 尝试 {attempt + 1}/3 失败，{delay}s 后重试: {e}")
                 time.sleep(delay)

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -535,44 +536,44 @@ class PortfolioService:
                 account_snapshot["public"].get("limitations", []),
             )
 
-            cash_cny, stale_cash, _ = self._convert_amount(
+            cash_cny, stale_cash, mode_cash = self._convert_amount(
                 amount=account_snapshot["total_cash"],
                 from_currency=account.base_currency,
                 to_currency=aggregate_currency,
                 as_of_date=as_of_date,
             )
-            mv_cny, stale_mv, _ = self._convert_amount(
+            mv_cny, stale_mv, mode_mv = self._convert_amount(
                 amount=account_snapshot["total_market_value"],
                 from_currency=account.base_currency,
                 to_currency=aggregate_currency,
                 as_of_date=as_of_date,
             )
             account_snapshot["public"]["total_market_value_aggregate"] = round(mv_cny, 6)
-            eq_cny, stale_eq, _ = self._convert_amount(
+            eq_cny, stale_eq, mode_eq = self._convert_amount(
                 amount=account_snapshot["total_equity"],
                 from_currency=account.base_currency,
                 to_currency=aggregate_currency,
                 as_of_date=as_of_date,
             )
-            realized_cny, stale_realized, _ = self._convert_amount(
+            realized_cny, stale_realized, mode_realized = self._convert_amount(
                 amount=account_snapshot["realized_pnl"],
                 from_currency=account.base_currency,
                 to_currency=aggregate_currency,
                 as_of_date=as_of_date,
             )
-            unrealized_cny, stale_unrealized, _ = self._convert_amount(
+            unrealized_cny, stale_unrealized, mode_unrealized = self._convert_amount(
                 amount=account_snapshot["unrealized_pnl"],
                 from_currency=account.base_currency,
                 to_currency=aggregate_currency,
                 as_of_date=as_of_date,
             )
-            fee_cny, stale_fee, _ = self._convert_amount(
+            fee_cny, stale_fee, mode_fee = self._convert_amount(
                 amount=account_snapshot["fee_total"],
                 from_currency=account.base_currency,
                 to_currency=aggregate_currency,
                 as_of_date=as_of_date,
             )
-            tax_cny, stale_tax, _ = self._convert_amount(
+            tax_cny, stale_tax, mode_tax = self._convert_amount(
                 amount=account_snapshot["tax_total"],
                 from_currency=account.base_currency,
                 to_currency=aggregate_currency,
@@ -586,6 +587,9 @@ class PortfolioService:
             aggregate["unrealized_pnl"] += unrealized_cny
             aggregate["fee_total"] += fee_cny
             aggregate["tax_total"] += tax_cny
+            if "missing_fx" in {mode_cash, mode_mv, mode_eq, mode_realized, mode_unrealized, mode_fee, mode_tax}:
+                aggregate["limitations"] = _merge_portfolio_limitations(aggregate["limitations"], ["missing_fx"])
+                account_snapshot["public"]["total_market_value_aggregate"] = None
             aggregate["fx_stale"] = aggregate["fx_stale"] or any(
                 [
                     stale_cash,
@@ -611,6 +615,9 @@ class PortfolioService:
             "fee_total": round(aggregate["fee_total"], 6),
             "tax_total": round(aggregate["tax_total"], 6),
             "fx_stale": aggregate["fx_stale"],
+            "valuation_complete": not any(
+                reason in aggregate["limitations"] for reason in ("missing_price", "missing_fx")
+            ),
             "data_quality": "partial" if aggregate["limitations"] else "ok",
             "limitations": aggregate["limitations"],
             "accounts": accounts_payload,
@@ -807,6 +814,7 @@ class PortfolioService:
         taxes_total_base = 0.0
         realized_pnl_base = 0.0
         fx_stale = False
+        fx_missing = False
 
         fifo_lots: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = defaultdict(list)
         avg_state: Dict[Tuple[str, str, str], _AvgState] = defaultdict(_AvgState)
@@ -875,7 +883,7 @@ class PortfolioService:
                             event_date,
                         )
                     realized_local = proceeds_net - cost_basis
-                    realized_base, stale_realized, _ = self._convert_amount(
+                    realized_base, stale_realized, mode_realized = self._convert_amount(
                         amount=realized_local,
                         from_currency=key[2],
                         to_currency=account.base_currency,
@@ -883,16 +891,17 @@ class PortfolioService:
                     )
                     realized_pnl_base += realized_base
                     fx_stale = fx_stale or stale_realized
+                    fx_missing = fx_missing or mode_realized == "missing_fx"
                 else:
                     raise ValueError(f"Unsupported trade side: {event.side}")
 
-                fee_base, stale_fee, _ = self._convert_amount(
+                fee_base, stale_fee, mode_fee = self._convert_amount(
                     amount=fee,
                     from_currency=key[2],
                     to_currency=account.base_currency,
                     as_of_date=event_date,
                 )
-                tax_base, stale_tax, _ = self._convert_amount(
+                tax_base, stale_tax, mode_tax = self._convert_amount(
                     amount=tax,
                     from_currency=key[2],
                     to_currency=account.base_currency,
@@ -901,6 +910,7 @@ class PortfolioService:
                 fees_total_base += fee_base
                 taxes_total_base += tax_base
                 fx_stale = fx_stale or stale_fee or stale_tax
+                fx_missing = fx_missing or "missing_fx" in {mode_fee, mode_tax}
                 continue
 
             if event_type == "corp":
@@ -950,7 +960,7 @@ class PortfolioService:
 
         total_cash_base = 0.0
         for currency, amount in cash_balances.items():
-            converted, stale, _ = self._convert_amount(
+            converted, stale, conversion_mode = self._convert_amount(
                 amount=amount,
                 from_currency=currency,
                 to_currency=account.base_currency,
@@ -958,6 +968,7 @@ class PortfolioService:
             )
             total_cash_base += converted
             fx_stale = fx_stale or stale
+            fx_missing = fx_missing or conversion_mode == "missing_fx"
 
         unrealized_pnl_base = market_value_base - total_cost_base
         total_equity_base = total_cash_base + market_value_base
@@ -969,6 +980,7 @@ class PortfolioService:
         limitations = _merge_portfolio_limitations(
             _portfolio_limitations_for_market(account.market),
             position_limitations,
+            ["missing_fx"] if fx_missing else [],
         )
 
         account_payload = {
@@ -988,6 +1000,7 @@ class PortfolioService:
             "fee_total": round(fees_total_base, 6),
             "tax_total": round(taxes_total_base, 6),
             "fx_stale": fx_stale,
+            "valuation_complete": not any(reason in limitations for reason in ("missing_price", "missing_fx")),
             "data_quality": "partial" if limitations else "ok",
             "limitations": limitations,
             "positions": position_rows,
@@ -1091,13 +1104,13 @@ class PortfolioService:
 
             if price_info.is_available:
                 local_market_value = qty * float(last_price)
-                market_base, stale_market, _ = self._convert_amount(
+                market_base, stale_market, mode_market = self._convert_amount(
                     amount=local_market_value,
                     from_currency=currency,
                     to_currency=account.base_currency,
                     as_of_date=as_of_date,
                 )
-                cost_base, stale_cost, _ = self._convert_amount(
+                cost_base, stale_cost, mode_cost = self._convert_amount(
                     amount=total_cost,
                     from_currency=currency,
                     to_currency=account.base_currency,
@@ -1105,10 +1118,15 @@ class PortfolioService:
                 )
                 unrealized_base = market_base - cost_base
                 fx_stale = fx_stale or stale_market or stale_cost
+                if "missing_fx" in {mode_market, mode_cost}:
+                    limitations = _merge_portfolio_limitations(limitations, ["missing_fx"])
+                    # Unknown conversions cannot produce a meaningful P&L.
+                    market_base = cost_base = unrealized_base = 0.0
             else:
                 market_base = 0.0
                 cost_base = 0.0
                 unrealized_base = 0.0
+                limitations = _merge_portfolio_limitations(limitations, ["missing_price"])
 
             unrealized_pct = None
             if abs(cost_base) > EPS:
@@ -1132,6 +1150,7 @@ class PortfolioService:
                     "price_date": price_info.price_date.isoformat() if price_info.price_date else None,
                     "price_stale": price_info.is_stale,
                     "price_available": price_info.is_available,
+                    "valuation_complete": price_info.is_available and "missing_fx" not in limitations,
                     "data_quality": "partial" if limitations else "ok",
                     "limitations": limitations,
                 }
@@ -1157,7 +1176,7 @@ class PortfolioService:
                 realtime_price, provider = self._fetch_realtime_position_price(symbol)
             else:
                 realtime_price, provider = realtime_prices.get(symbol, (None, None))
-            if realtime_price is not None and realtime_price > 0:
+            if realtime_price is not None and math.isfinite(realtime_price) and realtime_price > 0:
                 return _ResolvedPositionPrice(
                     price=float(realtime_price),
                     source="realtime_quote",
@@ -1170,7 +1189,7 @@ class PortfolioService:
         close = self.repo.get_latest_close_with_date(symbol=symbol, as_of=as_of_date)
         if close is not None:
             close_price, close_date = close
-            if close_price > 0:
+            if math.isfinite(close_price) and close_price > 0:
                 return _ResolvedPositionPrice(
                     price=float(close_price),
                     source="history_close",
@@ -1248,7 +1267,7 @@ class PortfolioService:
         except (TypeError, ValueError):
             return None, None
 
-        if numeric_price <= 0:
+        if not math.isfinite(numeric_price) or numeric_price <= 0:
             return None, None
 
         source = getattr(quote, "source", None)
@@ -1444,6 +1463,8 @@ class PortfolioService:
     ) -> Tuple[float, bool, str]:
         from_norm = self._normalize_currency(from_currency)
         to_norm = self._normalize_currency(to_currency)
+        if not math.isfinite(float(amount)):
+            raise ValueError("Portfolio amount must be finite")
         if abs(amount) <= EPS:
             return 0.0, False, "zero"
         if from_norm == to_norm:
@@ -1454,7 +1475,7 @@ class PortfolioService:
             to_currency=to_norm,
             as_of=as_of_date,
         )
-        if direct is not None and direct.rate > 0:
+        if direct is not None and math.isfinite(float(direct.rate)) and direct.rate > 0:
             return float(amount) * float(direct.rate), bool(direct.is_stale), "direct_rate"
 
         inverse = self.repo.get_latest_fx_rate(
@@ -1462,11 +1483,11 @@ class PortfolioService:
             to_currency=from_norm,
             as_of=as_of_date,
         )
-        if inverse is not None and inverse.rate > 0:
+        if inverse is not None and math.isfinite(float(inverse.rate)) and inverse.rate > 0:
             return float(amount) / float(inverse.rate), bool(inverse.is_stale), "inverse_rate"
 
-        # P0 fallback: keep pipeline available even when FX cache is missing.
-        return float(amount), True, "fallback_1_to_1"
+        # Legacy numeric fields contain known subtotals only, never guessed FX.
+        return 0.0, True, "missing_fx"
 
     def convert_amount(
         self,

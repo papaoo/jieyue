@@ -25,7 +25,10 @@ def _fetch_trend_data(stock_code: str):
     """Fetch historical OHLCV (DataFrame) for trend analysis. DB first, then DataFetcher fallback."""
     from src.services.history_loader import load_history_df
 
-    df, _ = load_history_df(stock_code, days=60)
+    df, source = load_history_df(stock_code, days=60)
+    if df is not None:
+        df = df.copy()
+        df.attrs['data_source'] = source
     return df
 
 
@@ -60,6 +63,10 @@ def _handle_analyze_trend(stock_code: str) -> dict:
         "ma20": result.ma20,
         "ma60": result.ma60,
         "current_price": result.current_price,
+        "as_of": str(df.iloc[-1]['date'])[:10] if 'date' in df.columns else None,
+        "price_basis": "daily_close",
+        "source": df.attrs.get('data_source', 'unknown'),
+        "data_limitations": ["Historical daily-bar analysis, not a live quote; score is not a profit probability."],
         "bias_ma5": round(result.bias_ma5, 2),
         "bias_ma10": round(result.bias_ma10, 2),
         "bias_ma20": round(result.bias_ma20, 2),
@@ -163,6 +170,60 @@ def _handle_calculate_ma(stock_code: str, periods: Optional[str] = None, days: i
         else "空头排列" if above_count == 0
         else f"混合({above_count}/{len(ma_values)}条均线上方)"
     )
+    result["ma_cross"] = _detect_ma_cross(close, period_list, lookback=3)
+    return result
+
+
+def _detect_ma_cross(close, period_list, lookback: int = 3) -> dict:
+    """Detect golden/death crosses of MA pairs within the last *lookback* bars.
+
+    The strategy skills (e.g. ``ma_golden_cross``: "MA5 在最近 3 个交易日内上穿
+    MA10") describe exactly this event, but nothing in the codebase evaluated it,
+    so the LLM could only guess from two latest MA values. Providing the fact
+    keeps the skill evaluable instead of rhetorical.
+    """
+    result: dict = {"lookback_bars": lookback, "pairs": {}, "golden_cross_pairs": [], "dead_cross_pairs": []}
+    usable = sorted({int(p) for p in period_list if int(p) > 0})
+    if close is None or len(close) < 3 or len(usable) < 2:
+        return result
+
+    try:
+        ma_series = {p: close.rolling(window=p).mean() for p in usable}
+    except Exception:  # pragma: no cover - defensive
+        return result
+
+    for i, fast in enumerate(usable):
+        for slow in usable[i + 1:]:
+            diff = ma_series[fast] - ma_series[slow]
+            diff = diff.dropna()
+            if len(diff) < 2:
+                continue
+            window = diff.tail(lookback)
+            values = window.tolist()
+            golden_idx = None
+            dead_idx = None
+            for offset in range(1, len(values)):
+                prev = values[offset - 1]
+                curr = values[offset]
+                if prev <= 0 < curr and golden_idx is None:
+                    golden_idx = offset
+                if prev >= 0 > curr and dead_idx is None:
+                    dead_idx = offset
+            key = f"ma{fast}_ma{slow}"
+            entry = {
+                "golden_cross": golden_idx is not None,
+                "death_cross": dead_idx is not None,
+                "bars_since_cross": None,
+                "state": "above" if values[-1] > 0 else ("below" if values[-1] < 0 else "flat"),
+            }
+            first_event = golden_idx if golden_idx is not None else dead_idx
+            if first_event is not None:
+                entry["bars_since_cross"] = len(values) - 1 - first_event
+            result["pairs"][key] = entry
+            if entry["golden_cross"]:
+                result["golden_cross_pairs"].append(key)
+            if entry["death_cross"]:
+                result["dead_cross_pairs"].append(key)
     return result
 
 
@@ -170,7 +231,9 @@ calculate_ma_tool = ToolDefinition(
     name="calculate_ma",
     description="Calculate moving averages (MA5/10/20/30/60/120/250 or custom periods) "
                 "for a stock. Returns each MA value, price bias %, and whether price "
-                "is above each MA. Also returns overall MA alignment (多头/空头/混合).",
+                "is above each MA. Also returns overall MA alignment (多头/空头/混合) "
+                "and ma_cross: whether any MA pair golden-crossed (金叉) or death-crossed "
+                "(死叉) within the last 3 bars, plus the current above/below state.",
     parameters=[
         ToolParameter(
             name="stock_code",
@@ -220,10 +283,18 @@ def _handle_get_volume_analysis(stock_code: str, days: int = 30) -> dict:
     close = df["close"]
     volume = df["volume"]
 
-    # Average volumes
-    avg_vol_5 = float(volume.tail(5).mean())
-    avg_vol_10 = float(volume.tail(10).mean())
-    avg_vol_20 = float(volume.tail(20).mean()) if len(df) >= 20 else avg_vol_10
+    # Average volumes.
+    # 口径：均量基准**不含当日**（volume.iloc[:-1]），与 stock_analyzer / screening
+    # 的 volume_ratio 一致。若把当日计入分母，当日放量 2 倍时算出的倍数只有约 1.55，
+    # 会系统性低估放量强度，导致「规则说没放量、LLM 说放量」。
+    prior_volume = volume.iloc[:-1]
+    avg_vol_5 = float(prior_volume.tail(5).mean()) if len(prior_volume) else 0.0
+    avg_vol_10 = float(prior_volume.tail(10).mean()) if len(prior_volume) else avg_vol_5
+    avg_vol_20 = (
+        float(prior_volume.tail(20).mean())
+        if len(prior_volume) >= 20
+        else avg_vol_10
+    )
     latest_vol = float(volume.iloc[-1])
     vol_ratio_5d = round(latest_vol / avg_vol_5, 2) if avg_vol_5 > 0 else None
     vol_ratio_20d = round(latest_vol / avg_vol_20, 2) if avg_vol_20 > 0 else None

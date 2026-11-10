@@ -28,6 +28,9 @@ class HardFilterConfig:
     change_60d_max: float | None = None
     require_ma_bullish: bool = False
     require_price_above_ma20: bool = False
+    require_volume_contraction: bool = False
+    require_pullback_convergence: bool = False
+    require_breakout_confirmation: bool = False
     signal_score_min: int | None = None
     macd_status_whitelist: list[str] | None = None
     rsi_status_whitelist: list[str] | None = None
@@ -64,6 +67,11 @@ class ScreeningConfig:
     event_profile: dict[str, Any] = field(default_factory=dict)
     ranking_hints: str = ""
     max_output: int = 5
+    evidence_mode: str = "legacy"
+
+    def __post_init__(self) -> None:
+        if self.evidence_mode not in ("legacy", "daily_required"):
+            raise ValueError("evidence_mode must be legacy or daily_required")
 
 
 @dataclass
@@ -131,6 +139,14 @@ class Pick:
     pe_ratio: float | None = None
     pb_ratio: float | None = None
     industry: str = ""
+    industry_taxonomy: str = ""
+    industry_code: str = ""
+    industry_as_of: str = ""
+    industry_source: str = ""
+    industry_evidence_id: str = ""
+    dividend_yield_ttm_pct: float | None = None
+    dividend_yield_ttm_as_of: str = ""
+    dividend_yield_ttm_unit: str = ""
     concepts: str = ""
     industry_rank: int | None = None
     industry_change_pct: float | None = None

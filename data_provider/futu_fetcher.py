@@ -56,12 +56,19 @@ def _hk_symbol(stock_code: str) -> Optional[str]:
     return f"HK.{digits.zfill(5)}"
 
 
+# OpenD 单次历史 K 线返回上限；达到上限即视为区间可能被截断（调用方按需告警/分段拉取）
+_FUTU_MAX_COUNT = 1000
+
+
 class FutuFetcher(BaseFetcher):
     """Futu OpenD adapter for DSA's existing provider contract."""
 
     name = "FutuFetcher"
     priority = int(os.getenv("FUTU_PRIORITY", "2"))
     allow_empty_daily_data = False
+    # 港股日线请求前复权价（AuType.QFQ），与 akshare/tushare 等 qfq 源同口径。
+    # 修复前使用 AuType.NONE（不复权），港股链回退到本源时序列基准会突变。
+    price_adjustment = "qfq"
 
     def __init__(self) -> None:
         self._ctx = None
@@ -324,11 +331,19 @@ class FutuFetcher(BaseFetcher):
                 start=start_date,
                 end=end_date,
                 ktype=ft.KLType.K_DAY,
-                autype=ft.AuType.NONE,
-                max_count=1000,
+                autype=ft.AuType.QFQ,
+                max_count=_FUTU_MAX_COUNT,
             )
             if ret != ft.RET_OK or data is None or data.empty:
                 return pd.DataFrame()
+            # OpenD 单次返回条数受 max_count 限制：命中上限说明区间可能被截断，
+            # 调用方必须知情（早期行情缺失会让指标/回测静默失真）。
+            if len(data) >= _FUTU_MAX_COUNT:
+                logger.warning(
+                    "[Futu] daily data可能不完整(%s): 返回 %d 条，已达单次上限 %d，"
+                    "更早的行情未返回；如需长区间请分段拉取",
+                    symbol, len(data), _FUTU_MAX_COUNT,
+                )
             return data.rename(columns={"time_key": "date", "turnover": "amount"})
         except Exception as exc:
             logger.warning("[Futu] daily data failed(%s): %s", symbol, exc)

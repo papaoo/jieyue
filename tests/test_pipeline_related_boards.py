@@ -20,6 +20,7 @@ from src.utils.data_processing import (
 
 class _SlowConceptRankingFetcher:
     name = "SlowConceptRankingFetcher"
+    priority = 1
 
     def __init__(self) -> None:
         self.calls = 0
@@ -197,10 +198,8 @@ class PipelineRelatedBoardsTestCase(unittest.TestCase):
 
     def test_concept_rankings_cache_is_shared_across_manager_instances(self) -> None:
         fetcher = _SlowConceptRankingFetcher()
-        first_manager = DataFetcherManager.__new__(DataFetcherManager)
-        first_manager._fetchers = [fetcher]
-        second_manager = DataFetcherManager.__new__(DataFetcherManager)
-        second_manager._fetchers = [fetcher]
+        first_manager = DataFetcherManager(fetchers=[fetcher])
+        second_manager = DataFetcherManager(fetchers=[fetcher])
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             first_result, second_result = list(

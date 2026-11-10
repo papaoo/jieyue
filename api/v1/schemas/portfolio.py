@@ -166,6 +166,7 @@ class PortfolioPositionItem(BaseModel):
     price_date: Optional[str] = None
     price_stale: bool = False
     price_available: bool = True
+    valuation_complete: bool = True
     data_quality: str = "ok"
     limitations: List[str] = Field(default_factory=list)
 
@@ -196,6 +197,7 @@ class PortfolioAccountSnapshot(BaseModel):
     fee_total: float
     tax_total: float
     fx_stale: bool
+    valuation_complete: bool = True
     data_quality: str = "ok"
     limitations: List[str] = Field(default_factory=list)
     positions: List[PortfolioPositionItem] = Field(default_factory=list)
@@ -214,6 +216,7 @@ class PortfolioSnapshotResponse(BaseModel):
     fee_total: float
     tax_total: float
     fx_stale: bool
+    valuation_complete: bool = True
     data_quality: str = "ok"
     limitations: List[str] = Field(default_factory=list)
     accounts: List[PortfolioAccountSnapshot] = Field(default_factory=list)

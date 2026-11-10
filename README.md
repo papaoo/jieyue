@@ -1,6 +1,10 @@
 <div align="center">
 
-# 📈 股票智能分析系统
+# 阶跃 · Jieyue
+
+面向个人研究的股票分析工作台：市场复盘、规则选股、个股研判、数据核验与飞书多群简报。
+
+本仓库在 [daily_stock_analysis](https://github.com/ZhuLinsen/daily_stock_analysis) 基础上二次开发，保留上游许可证与历史。当前阶跃入口：[本地启动](docs/local-windows.md) · [飞书简报](docs/feishu-research-delivery.md) · [免费模型](docs/free-models.md) · [策略回测口径](docs/screening-backtest.md)。以下保留上游项目说明与致谢；功能是否可用以本机数据权限和实际运行结果为准。
 
 [![GitHub stars](https://img.shields.io/github/stars/ZhuLinsen/daily_stock_analysis?style=social)](https://github.com/ZhuLinsen/daily_stock_analysis/stargazers)
 [![arXiv](https://img.shields.io/badge/arXiv-2608.26990-b31b1b.svg)](https://arxiv.org/abs/2608.26990)

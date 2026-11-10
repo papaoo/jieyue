@@ -104,9 +104,21 @@ class PerformanceMetrics(BaseModel):
     avg_stock_return_pct: Optional[float] = None
     avg_simulated_return_pct: Optional[float] = None
 
+    # 风险/质量指标（v2）：只看胜率会被"高胜率小亏低赚"误导
+    benchmark_avg_return_pct: Optional[float] = None
+    excess_vs_benchmark_pct: Optional[float] = None
+    profit_factor: Optional[float] = None
+    max_drawdown_pct: Optional[float] = None
+    avg_win_return_pct: Optional[float] = None
+    avg_loss_return_pct: Optional[float] = None
+    largest_loss_pct: Optional[float] = None
+    largest_win_pct: Optional[float] = None
+    drawdown_series_points: Optional[int] = None
+
     stop_loss_trigger_rate: Optional[float] = None
     take_profit_trigger_rate: Optional[float] = None
     ambiguous_rate: Optional[float] = None
+    ambiguous_count: Optional[int] = None
     avg_days_to_first_hit: Optional[float] = None
 
     advice_breakdown: Dict[str, Any] = Field(default_factory=dict)

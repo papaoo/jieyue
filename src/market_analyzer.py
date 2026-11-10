@@ -25,6 +25,7 @@ from src.config import get_config
 from src.report_language import normalize_report_language
 from src.search_service import SearchService
 from src.core.market_profile import get_profile, MarketProfile
+from src.core.trading_calendar import build_market_phase_context
 from src.core.market_strategy import get_market_strategy_blueprint
 from src.llm.backend_registry import (
     LOCAL_CLI_GENERATION_BACKEND_IDS,
@@ -100,6 +101,7 @@ class MarketOverview:
     limit_up_count: int = 0             # 涨停家数
     limit_down_count: int = 0           # 跌停家数
     total_amount: float = 0.0           # 两市成交额（亿元）
+    statistics_metadata: Dict[str, Any] = field(default_factory=dict)
     # north_flow: float = 0.0           # 北向资金净流入（亿元）- 已废弃，接口不可用
     
     # 板块涨幅榜
@@ -633,6 +635,8 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 overview.limit_up_count = stats.get('limit_up_count', 0)
                 overview.limit_down_count = stats.get('limit_down_count', 0)
                 overview.total_amount = stats.get('total_amount', 0.0)
+                overview.statistics_metadata = {key: stats[key] for key in
+                    ('as_of', 'source', 'kind', 'amount_unit', 'observed_count') if key in stats}
 
                 logger.info(
                     "[大盘] %s action=get_market_stats status=success up=%s down=%s flat=%s "
@@ -1038,6 +1042,7 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             "date": overview.date,
             "market_scope": self._get_market_scope_name(language),
             "indices": [idx.to_dict() for idx in overview.indices],
+            "statistics_metadata": dict(overview.statistics_metadata),
             "sectors": {
                 "top": list(overview.top_sectors or []),
                 "bottom": list(overview.bottom_sectors or []),
@@ -1220,6 +1225,8 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                     f"Limit-up {overview.limit_up_count} / Limit-down {overview.limit_down_count}; "
                     f"Turnover {overview.total_amount:.0f} ({self._get_turnover_unit_label()})"
                 )
+            if has_stats:
+                lines.append(self._statistics_provenance(overview))
             return "\n".join(lines)
         lines = []
         score = light["score"] if isinstance(light, dict) else None
@@ -1247,7 +1254,18 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                     f"| 两市成交额 | {overview.total_amount:.0f} 亿 | {self._describe_turnover(overview.total_amount)} |",
                 ]
             )
+        if has_stats:
+            lines.append(self._statistics_provenance(overview))
         return "\n".join(lines)
+
+    @staticmethod
+    def _statistics_provenance(overview: MarketOverview) -> str:
+        meta = overview.statistics_metadata
+        return ('> Breadth as_of=' + str(meta.get('as_of') or 'unknown')
+                + '; source=' + str(meta.get('source') or 'unknown')
+                + '; kind=' + str(meta.get('kind') or 'unknown')
+                + '; observed_count=' + str(meta.get('observed_count', 'unknown'))
+                + '. Source date is not report generation date; unknown dates require verification.')
 
     def build_market_light_snapshot(self, overview: MarketOverview) -> Dict[str, Any]:
         """Build a deterministic market-light snapshot from structured breadth data."""
@@ -1380,8 +1398,12 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             and not overview.bottom_concepts
         ):
             return ""
-        lines = []
         language = self._get_review_language()
+        lines = [
+            ("> Timing: each ranking has its own observation date. Older/undated rankings are background, not today's leading theme; one return snapshot cannot establish acceleration or persistence."
+             if language == 'en' else
+             "> 时效边界：榜单以各行数据日期为准；旧日或日期未知的排名仅作背景，不代表今日主线。单日涨幅不能证明加速或持续性。")
+        ]
 
         def append_ranking(title: str, name_label: str, rows: List[Dict]) -> None:
             if not rows:
@@ -1390,12 +1412,12 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 lines.append("")
             lines.extend([
                 title,
-                f"| {'Rank' if language == 'en' else '排名'} | {name_label} | {'Change' if language == 'en' else '涨跌幅'} |",
-                "|------|------|--------|",
+                f"| {'Rank' if language == 'en' else '排名'} | {name_label} | {'Change' if language == 'en' else '涨跌幅'} | {'Date / source / basis' if language == 'en' else '数据日期 / 来源 / 口径'} |",
+                "|------|------|--------|--------|",
             ])
             for rank, item in enumerate(rows[:5], 1):
                 lines.append(
-                    f"| {rank} | {item.get('name', '-')} | {self._format_signed_pct(item.get('change_pct'))} |"
+                    f"| {rank} | {item.get('name', '-')} | {self._format_signed_pct(item.get('change_pct'))} | {self._ranking_provenance(item)} |"
                 )
 
         if language == "en":
@@ -1487,8 +1509,18 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             name = str(item.get("name") or "").strip()
             if not name:
                 continue
-            parts.append(f"{name}({cls._format_signed_pct(item.get('change_pct'))})")
+            parts.append(f"{name}({cls._format_signed_pct(item.get('change_pct'))}) [{cls._ranking_provenance(item)}]")
         return ", ".join(parts)
+
+    @staticmethod
+    def _ranking_provenance(item: Dict) -> str:
+        fields = {key: item.get(key) for key in (
+            'as_of', 'source', 'definition', 'coverage_complete', 'coverage_ratio',
+            'membership_is_point_in_time', 'definition_warning',
+        ) if item.get(key) is not None}
+        fields.setdefault('as_of', 'unknown')
+        fields.setdefault('source', 'unknown')
+        return '; '.join(f'{key}={value}' for key, value in fields.items()).replace('|', '/')
 
     @staticmethod
     def _escape_markdown_link_label(value: str) -> str:
@@ -1652,6 +1684,15 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
     def _build_review_prompt(self, overview: MarketOverview, news: List) -> str:
         """构建复盘报告 Prompt"""
         review_language = self._get_review_language()
+        phase = build_market_phase_context(market=self.region)
+        timing_boundary = (
+            f"Data acquisition context: {datetime.now().astimezone().isoformat()}; market phase={phase.phase.value}. "
+            "Use each source's observation date, not request time. Intraday prices are latest quotes, not closing prices. "
+            "Intraday turnover is cumulative so far; without a same-time historical baseline, do not compare it with full-day turnover or infer shrinking liquidity. "
+            "Unknown source timestamps must be disclosed as unknown."
+            " Sector ranking as_of is authoritative: older/undated sectors are historical background, never today's mainline. "
+            "A single ranking cannot prove acceleration, persistence or fund inflows. Distinguish facts, hypotheses and next validation conditions."
+        )
         # Korean reuses the English structural template but the model is told to
         # write the entire shell, headings, guidance and conclusion in Korean.
         shell_language_label = "Korean (한국어)" if self._get_output_language() == "ko" else "English"
@@ -1691,7 +1732,8 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 stats_block = f"""## Market Breadth
 - Advancers: {overview.up_count} | Decliners: {overview.down_count} | Flat: {overview.flat_count}
 - Limit-up: {overview.limit_up_count} | Limit-down: {overview.limit_down_count}
-- Turnover: {overview.total_amount:.0f} ({self._get_turnover_unit_label()})"""
+- Turnover: {overview.total_amount:.0f} ({self._get_turnover_unit_label()})
+{self._statistics_provenance(overview)}"""
 
             if self.profile.has_sector_rankings:
                 sector_block = f"""## Sector / Theme Performance
@@ -1714,7 +1756,8 @@ Concept lagging: {bottom_concepts_text if bottom_concepts_text else "N/A"}"""
                 stats_block = f"""## 市场概况
 - 上涨: {overview.up_count} 家 | 下跌: {overview.down_count} 家 | 平盘: {overview.flat_count} 家
 - 涨停: {overview.limit_up_count} 家 | 跌停: {overview.limit_down_count} 家
-- 两市成交额: {overview.total_amount:.0f} 亿元"""
+- 两市成交额: {overview.total_amount:.0f} 亿元
+{self._statistics_provenance(overview)}"""
 
             if self.profile.has_sector_rankings:
                 sector_block = f"""## 板块表现
@@ -1784,6 +1827,7 @@ Concept lagging: {bottom_concepts_text if bottom_concepts_text else "N/A"}"""
             return f"""You are a professional {self._get_market_scope_name('en')} analyst. Please produce a concise market recap report based on the data below.
 
 [Requirements]
+- {timing_boundary}
 - Output pure Markdown only
 - No JSON
 - No code blocks
@@ -1837,6 +1881,8 @@ Output the report content directly, no extra commentary.
         return f"""你是一位专业的{self._get_market_scope_name('zh')}分析师，请根据以下数据生成一份结构化的{self._get_market_scope_name('zh')}大盘复盘报告。
 
 【重要】输出要求：
+- 数据时点约束：{timing_boundary}
+- 盘中禁止使用“收于/收涨/收跌”；成交额标注“截至采集时累计”，没有同一时刻历史基准不得断言缩量。
 - 必须输出纯 Markdown 文本格式
 - 禁止输出 JSON 格式
 - 禁止输出代码块

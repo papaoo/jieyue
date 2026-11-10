@@ -5,6 +5,7 @@ import { Link } from 'react-router-dom';
 import { dataCapabilityApi } from '../api/dataCapability';
 import { AppPage, Badge, Button, Card, EmptyState, InlineAlert, Loading, PageHeader } from '../components/common';
 import { useUiLanguage } from '../contexts/UiLanguageContext';
+import { BRAND } from '../config/brand';
 import type { DataCapabilityOverview, DatasetQualityStatus, ProviderCapabilityStatus } from '../types/dataCapability';
 import { formatDateTime } from '../utils/format';
 
@@ -50,15 +51,15 @@ function SummaryTile({ label, value, note }: { label: string; value: number; not
 }
 
 const DataCenterPage: React.FC = () => {
-  const { t } = useUiLanguage();
+  const { t, language } = useUiLanguage();
   const [overview, setOverview] = useState<DataCapabilityOverview | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const requestGeneration = useRef(0);
 
   useEffect(() => {
-    document.title = `${t('dataCenter.title')} - DSA`;
-  }, [t]);
+    document.title = `${t('dataCenter.title')} - ${language === 'zh' ? BRAND.name : BRAND.englishName}`;
+  }, [t, language]);
 
   const load = useCallback(async () => {
     const generation = ++requestGeneration.current;

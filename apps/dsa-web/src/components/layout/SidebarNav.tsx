@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Activity, BarChart3, Bell, BriefcaseBusiness, Database, Gauge, Home, LogOut, MessageSquareQuote, Search, Settings2 } from 'lucide-react';
+import { Activity, BarChart3, Bell, BriefcaseBusiness, Database, Gauge, Home, LogOut, MessageSquareQuote, Orbit, Search, Settings2, Waves } from 'lucide-react';
 import { NavLink, useLocation } from 'react-router-dom';
 import { useAuth } from '../../contexts/AuthContext';
 import { useAgentChatStore } from '../../stores/agentChatStore';
@@ -10,6 +10,9 @@ import { ConfirmDialog } from '../common/ConfirmDialog';
 import { StatusDot } from '../common/StatusDot';
 import { UiLanguageToggle } from '../i18n/UiLanguageToggle';
 import { ThemeToggle } from '../theme/ThemeToggle';
+import { BRAND } from '../../config/brand';
+import { BrandMark } from '../brand/BrandMark';
+import { useMotionPreference } from '../../contexts/MotionPreferenceContext';
 
 type SidebarNavProps = {
   collapsed?: boolean;
@@ -32,6 +35,7 @@ const NAV_ITEMS: NavItem[] = [
   { key: 'screening', labelKey: 'layout.nav.screening', to: '/screening', icon: Search },
   { key: 'portfolio', labelKey: 'layout.nav.portfolio', to: '/portfolio', icon: BriefcaseBusiness },
   { key: 'decision-signals', labelKey: 'layout.nav.decisionSignals', to: '/decision-signals', icon: Activity },
+  { key: 'research', labelKey: 'layout.nav.research', to: '/research', icon: Orbit },
   { key: 'backtest', labelKey: 'layout.nav.backtest', to: '/backtest', icon: BarChart3 },
   { key: 'alerts', labelKey: 'layout.nav.alerts', to: '/alerts', icon: Bell },
   { key: 'data', labelKey: 'layout.nav.dataCenter', to: '/data', icon: Database },
@@ -43,11 +47,12 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({ collapsed = false, onNav
   const { authEnabled, logout } = useAuth();
   const location = useLocation();
   const { t } = useUiLanguage();
+  const { motionEnabled, toggleMotion } = useMotionPreference();
   const completionBadge = useAgentChatStore((state) => state.completionBadge);
   const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
   const isRail = variant === 'rail';
   const itemBaseClass = cn(
-    'group relative flex h-[var(--nav-item-height)] w-full items-center overflow-hidden rounded-2xl border border-transparent text-sm leading-none text-secondary-text transition-all',
+    'workbench-nav-item group relative flex h-[var(--nav-item-height)] w-full items-center overflow-hidden rounded-xl border border-transparent text-sm leading-none text-secondary-text transition-colors',
     isRail
       ? 'justify-center gap-2.5 px-2'
       : collapsed
@@ -77,14 +82,17 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({ collapsed = false, onNav
             isRail ? 'h-9 w-9 rounded-[1rem]' : 'h-10 w-10 rounded-2xl'
           )}
         >
-          <BarChart3 className={cn(isRail ? 'h-[19px] w-[19px]' : 'h-5 w-5')} />
+          <BrandMark className="h-7 w-7" />
         </div>
         {!collapsed ? (
-          <p className={cn('min-w-0 truncate font-semibold text-foreground', isRail ? 'text-[0.95rem] leading-none' : 'text-sm')}>DSA</p>
+          <div className="workbench-brand-wordmark min-w-0">
+            <p className="truncate text-lg font-semibold tracking-[0.1em] text-foreground">{BRAND.name}</p>
+            {!isRail ? <p className="mt-1 text-[10px] uppercase tracking-[0.13em] text-muted-text">{BRAND.englishName}</p> : null}
+          </div>
         ) : null}
       </div>
 
-      <nav className={cn('flex flex-col gap-1.5', isRail ? 'min-h-0 overflow-y-auto' : 'flex-1')} aria-label={t('layout.mainNav')}>
+      <nav className={cn('flex min-h-0 flex-col gap-1 overflow-y-auto', isRail ? '' : 'flex-1')} aria-label={t('layout.mainNav')}>
         {NAV_ITEMS.map(({ key, labelKey, to, icon: Icon, exact, badge }) => {
           const label = t(labelKey);
           return (
@@ -126,6 +134,11 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({ collapsed = false, onNav
       </nav>
 
       <div className="mt-1.5 flex shrink-0 flex-col gap-1.5">
+        <button type="button" onClick={toggleMotion} aria-pressed={motionEnabled}
+          aria-label={t('layout.motion')} className={itemInteractiveClass}>
+          <Waves className={itemIconClass} aria-hidden="true" />
+          {!collapsed ? <><span className={itemLabelClass}>{t('layout.motion')}</span><span className="ml-auto text-xs" aria-hidden="true">{motionEnabled ? '●' : '○'}</span></> : null}
+        </button>
         <ThemeToggle
           variant={isRail ? 'rail' : 'nav'}
           collapsed={collapsed}
@@ -149,6 +162,7 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({ collapsed = false, onNav
       {authEnabled ? (
         <button
           type="button"
+          aria-label={t('layout.logout')}
           onClick={() => setShowLogoutConfirm(true)}
           className={cn(
             itemInteractiveClass,
@@ -164,7 +178,9 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({ collapsed = false, onNav
       <ConfirmDialog
         isOpen={showLogoutConfirm}
         title={t('layout.logoutTitle')}
-        message={t(/^\/settings\/?$/.test(location.pathname) ? 'layout.logoutSettingsMessage' : 'layout.logoutMessage')}
+        message={t(/^\/settings\/?$/.test(location.pathname)
+          ? 'layout.logoutSettingsMessage'
+          : /^\/research\/?$/.test(location.pathname) ? 'layout.logoutResearchMessage' : 'layout.logoutMessage')}
         confirmText={t('layout.logoutConfirm')}
         cancelText={t('common.cancel')}
         isDanger

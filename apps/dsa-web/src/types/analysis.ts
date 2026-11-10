@@ -137,12 +137,19 @@ export interface SectorRankingItem {
   code?: string;
   changePct?: number;
   source?: string;
+  asOf?: string;
+  definition?: string;
+  coverage?: Record<string, unknown>;
   updatedAt?: string;
 }
 
 export interface SectorRankings {
   top?: SectorRankingItem[];
   bottom?: SectorRankingItem[];
+  source?: string;
+  asOf?: string;
+  definition?: string;
+  coverage?: Record<string, unknown>;
 }
 
 export type MarketStructureStatus = 'ok' | 'partial' | 'unknown' | 'not_supported';

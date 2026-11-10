@@ -3,8 +3,8 @@
 # 稳健价值策略
 name: quality_value
 display_name: 稳健价值
-description: 估值合理、流动性充足、波动不过热，并要求有温和活跃度确认的稳健候选
-version: "1.1"
+description: 基于估值、流动性与价格稳定性代理的稳健观察候选，未验证盈利或现金流质量
+version: "2.1"
 category: value
 tags: [value, quality, stability, dynamic_signal]
 style:
@@ -16,6 +16,7 @@ style:
   ui_badge: 稳健
 
 screening:
+  evidence_mode: daily_required
   enabled: true
   market_scope: [cn]
   hard_filters:
@@ -69,5 +70,5 @@ screening:
     优先关注：
     1. 估值合理且不是依赖单日情绪推动的标的
     2. 成交额足够、涨跌幅不过热，适合后续深度分析
-    3. 兼顾行业地位、现金流质量、分红或经营稳定性线索
+    3. 行业地位、现金流质量、分红与经营稳定性需独立核验，不属于已实现硬筛选
   max_output: 5

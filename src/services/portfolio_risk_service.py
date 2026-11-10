@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import logging
+import json
+import math
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -280,6 +282,9 @@ class PortfolioRiskService:
         return max(window_start, min(first_activity_candidates))
 
     def _build_concentration(self, snapshot: Dict[str, Any], threshold_pct: float, *, as_of_date: date) -> Dict[str, Any]:
+        if snapshot.get("valuation_complete") is False:
+            return {"available": False, "reason": "incomplete_valuation", "total_market_value": None,
+                    "top_weight_pct": None, "alert": False, "top_positions": []}
         total_mv = float(snapshot.get("total_market_value", 0.0) or 0.0)
         exposure_by_symbol: Dict[str, float] = {}
         for account in snapshot.get("accounts", []):
@@ -289,12 +294,15 @@ class PortfolioRiskService:
                     continue
                 market_value = float(pos.get("market_value_base") or 0.0)
                 valuation_currency = str(pos.get("valuation_currency") or account.get("base_currency") or "CNY")
-                converted, _, _ = self.portfolio_service.convert_amount(
+                converted, _, mode = self.portfolio_service.convert_amount(
                     amount=market_value,
                     from_currency=valuation_currency,
                     to_currency="CNY",
                     as_of_date=as_of_date,
                 )
+                if mode == "missing_fx":
+                    return {"available": False, "reason": "incomplete_valuation", "total_market_value": None,
+                            "top_weight_pct": None, "alert": False, "top_positions": []}
                 exposure_by_symbol[symbol] = exposure_by_symbol.get(symbol, 0.0) + converted
 
         rows = []
@@ -325,6 +333,9 @@ class PortfolioRiskService:
         *,
         as_of_date: date,
     ) -> Dict[str, Any]:
+        if snapshot.get("valuation_complete") is False:
+            return {"available": False, "reason": "incomplete_valuation", "total_market_value": None,
+                    "top_weight_pct": None, "alert": False, "top_sectors": [], "coverage": {}, "errors": []}
         total_mv = float(snapshot.get("total_market_value", 0.0) or 0.0)
         sector_exposure: Dict[str, float] = {}
         sector_symbols: Dict[str, set] = {}
@@ -345,12 +356,15 @@ class PortfolioRiskService:
 
                 market_value = float(pos.get("market_value_base") or 0.0)
                 valuation_currency = str(pos.get("valuation_currency") or account.get("base_currency") or "CNY")
-                converted, _, _ = self.portfolio_service.convert_amount(
+                converted, _, mode = self.portfolio_service.convert_amount(
                     amount=market_value,
                     from_currency=valuation_currency,
                     to_currency="CNY",
                     as_of_date=as_of_date,
                 )
+                if mode == "missing_fx":
+                    return {"available": False, "reason": "incomplete_valuation", "total_market_value": None,
+                            "top_weight_pct": None, "alert": False, "top_sectors": [], "coverage": {}, "errors": []}
 
                 sector = self._resolve_primary_sector(
                     symbol=symbol,
@@ -489,18 +503,44 @@ class PortfolioRiskService:
 
         grouped: Dict[str, float] = {}
         stale_flag = False
+        incomplete_dates = set()
         for row in rows:
             key = row.snapshot_date.isoformat()
-            converted, stale, _ = self.portfolio_service.convert_amount(
+            try:
+                payload = json.loads(row.payload) if getattr(row, "payload", None) else {}
+            except (ValueError, TypeError):
+                payload = {}
+            legacy_missing_price = "valuation_complete" not in payload and (
+                "missing_price" in (payload.get("limitations") or [])
+                or any(
+                    position.get("price_available") is False or position.get("price_source") == "missing"
+                    for position in payload.get("positions", []) if isinstance(position, dict)
+                )
+            )
+            if payload.get("valuation_complete") is False or (
+                "valuation_complete" not in payload and bool(row.fx_stale)
+            ) or legacy_missing_price:
+                incomplete_dates.add(key)
+                continue
+            converted, stale, mode = self.portfolio_service.convert_amount(
                 amount=float(row.total_equity or 0.0),
                 from_currency=str(row.base_currency or "CNY"),
                 to_currency="CNY",
                 as_of_date=row.snapshot_date,
             )
+            if mode == "missing_fx":
+                incomplete_dates.add(key)
+                continue
             grouped[key] = grouped.get(key, 0.0) + converted
             stale_flag = stale_flag or stale or bool(row.fx_stale)
 
-        series: List[Tuple[str, float]] = sorted(grouped.items(), key=lambda item: item[0])
+        series: List[Tuple[str, float]] = sorted(
+            ((key, value) for key, value in grouped.items() if key not in incomplete_dates), key=lambda item: item[0]
+        )
+        if incomplete_dates:
+            return {"available": False, "reason": "incomplete_valuation", "series_points": len(series),
+                    "max_drawdown_pct": None, "current_drawdown_pct": None, "alert": False,
+                    "fx_stale": True, "incomplete_dates": sorted(incomplete_dates)}
         peak = 0.0
         max_drawdown = 0.0
         current_drawdown = 0.0
@@ -532,7 +572,8 @@ class PortfolioRiskService:
             for pos in account.get("positions", []):
                 avg_cost = float(pos.get("avg_cost", 0.0) or 0.0)
                 last_price = float(pos.get("last_price", 0.0) or 0.0)
-                if avg_cost <= 0:
+                if (pos.get("price_available") is False or not math.isfinite(last_price)
+                        or last_price <= 0 or avg_cost <= 0):
                     continue
                 loss_pct = max(0.0, (avg_cost - last_price) / avg_cost * 100.0)
                 if loss_pct < near_threshold:
@@ -551,6 +592,8 @@ class PortfolioRiskService:
 
         warnings.sort(key=lambda item: item["loss_pct"], reverse=True)
         return {
+            "available": snapshot.get("valuation_complete") is not False,
+            "reason": "incomplete_valuation" if snapshot.get("valuation_complete") is False else "",
             "near_alert": len(warnings) > 0,
             "triggered_count": sum(1 for item in warnings if item["is_triggered"]),
             "near_count": len(warnings),

@@ -7,11 +7,13 @@ import copy
 import json
 import logging
 import os
+from urllib.parse import urlparse
 from dataclasses import dataclass
 
 from src.config import apply_litellm_api_surface
 from src.llm.errors import call_litellm_with_param_recovery
 from src.llm.generation_params import apply_litellm_generation_params
+from src.llm.response_content import strip_leading_think_wrapper
 from src.services.screening.models import Pick
 from src.services.screening.normalize import (
     bounded_float as _bounded_float,
@@ -72,6 +74,14 @@ class LLMRankingResult:
             self.attempted_models = []
 
 
+class RankingResponseError(ValueError):
+    """A transport response cannot be trusted as completed structured output."""
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
+
+
 def rank_candidates(
     candidates: list[Pick],
     ranking_hints: str,
@@ -91,7 +101,7 @@ def rank_candidates(
     config_path: str = "",
     timeout_sec: float = 60.0,
     max_prompt_chars: int | None = _DEFAULT_RANKING_PROMPT_MAX_CHARS,
-    max_tokens: int | None = 2048,
+    max_tokens: int | None = 8192,
 ) -> list[Pick]:
     """Use LLM to re-rank candidates and add ranking_reason / risk_summary.
 
@@ -139,7 +149,7 @@ def rank_candidates_with_metadata(
     timeout_sec: float = 60.0,
     max_prompt_chars: int | None = _DEFAULT_RANKING_PROMPT_MAX_CHARS,
     degradation: list[str] | None = None,
-    max_tokens: int | None = 2048,
+    max_tokens: int | None = 8192,
 ) -> LLMRankingResult:
     """Use LLM to re-rank candidates and return global research metadata."""
     if not candidates:
@@ -190,6 +200,10 @@ def rank_candidates_with_metadata(
                     max_tokens=max_tokens,
                 )
             except Exception as exc:
+                if isinstance(exc, RankingResponseError):
+                    failure_reason = exc.reason
+                    model_errors.append(exc.reason)
+                    continue
                 failure_reason = "timeout" if _is_timeout_error(exc) else "call_failed"
                 model_errors.append(f"{failure_reason}:{exc.__class__.__name__}")
                 break
@@ -198,16 +212,16 @@ def rank_candidates_with_metadata(
             last_coverage = parsed.coverage
             model_errors.extend(parsed.errors)
             if parsed.coverage < min_coverage:
-                failure_reason = "invalid_response"
+                failure_reason = "empty_response" if "empty_response" in parsed.errors else "invalid_response"
                 continue
 
             ranked = parsed.picks
             for i, pick in enumerate(ranked):
                 pick.rank = i + 1
-                if pick.llm_score is None:
-                    pick.llm_score = 100.0 - i * (100.0 / max(len(ranked), 1))
                 weight = min(max(rank_weight, 0.0), 1.0)
-                pick.final_score = pick.screen_score * (1 - weight) + (pick.llm_score or 0) * weight
+                # A code omitted by the model is not a model-reviewed pick.
+                pick.final_score = (pick.screen_score if pick.llm_score is None else
+                                    pick.screen_score * (1 - weight) + pick.llm_score * weight)
             ranked.sort(key=lambda item: item.final_score, reverse=True)
             for i, pick in enumerate(ranked, start=1):
                 pick.rank = i
@@ -294,6 +308,8 @@ def _render_ranking_prompt(hints: str, context: str, candidates_text: str) -> st
 
 ## 输出要求
 只返回 JSON，不要 Markdown，不要解释 JSON 以外的文本。
+覆盖全部候选代码；每项只输出下列7个字段，reason/risk各不超过25个汉字，risk_flags最多2项。禁止展开长篇背景或思考过程。
+行业/主题新闻只能作为背景，不能写成该公司的已确认催化。
 格式：
 {{
   "market_view": "一句话概括当前候选池和市场背景是否适合该策略",
@@ -304,17 +320,10 @@ def _render_ranking_prompt(hints: str, context: str, candidates_text: str) -> st
       "code": "股票代码",
       "llm_score": 0-100,
       "confidence": 0-1,
-      "sector": "行业/主题短标签，优先参考候选的 industry/concepts，并尽量统一，如 券商、银行、医药、AI算力",
-      "theme": "主要交易逻辑或主题",
-      "thesis": "该候选入选的核心投资假设",
+      "sector": "已知行业；未知则空字符串，禁止猜测",
       "reason": "一句话排序理由",
-      "risk": "一句话主要风险",
-      "catalysts": ["潜在催化1", "潜在催化2"],
-      "risk_flags": ["风险标签1"],
-      "tags": ["价值", "趋势", "防守", "事件", "流动性"],
-      "style_fit": "与策略风格的匹配度说明",
-      "watch_items": ["后续应跟踪的数据或事件"],
-      "invalidators": ["会推翻该候选逻辑的观察点"]
+      "risk": "一句话主要风险；注明证据缺失",
+      "risk_flags": ["仅填证据支持的具体风险；无已知风险则空列表"]
     }}
   ]
 }}
@@ -510,10 +519,45 @@ def _format_dsa_context_for_prompt(p: Pick) -> str:
         available = [
             str(key)
             for key, value in coverage.items()
-            if str(value).lower() in {"available", "partial"}
+            if str(value).lower() in {"ok", "available", "partial"}
         ]
         if available:
             parts.append(f"fundamental_coverage={','.join(available[:5])}")
+    facts = {}
+    for name in ("valuation", "growth", "earnings", "capital_flow", "boards", "institution", "dragon_tiger"):
+        block = fundamentals.get(name) or {}
+        data = block.get("data") or {}
+        if not data:
+            continue
+        if name == "earnings":
+            original_dividend = data.get('dividend') or {}
+            dividend = {key: original_dividend[key] for key in (
+                'ttm_dividend_yield_pct', 'ttm_cash_dividend_per_share', 'ttm_event_count',
+                'as_of', 'as_of_events', 'price_basis', 'cash_unit', 'definition', 'definition_events',
+                'window_start_exclusive', 'window_end', 'events_complete', 'latest_implemented_ex_date')
+                if key in original_dividend}
+            data = {"financial_report": data.get("financial_report", {}), "dividend": dividend}
+        elif name == "capital_flow":
+            rankings = data.get('sector_rankings') or {}
+            data = {"stock_flow": data.get("stock_flow", {}),
+                    "sector_context": {key: rankings.get(key) for key in (
+                        'related_industry', 'as_of', 'definition', 'coverage_complete', 'membership_is_point_in_time')}}
+        elif name == "boards":
+            rankings = data.get('sector_rankings') or {}
+            data = {"industry": data.get("industry"), "sector_context": {key: rankings.get(key) for key in (
+                'related_industry', 'as_of', 'definition', 'coverage_complete', 'membership_is_point_in_time')}}
+        elif name == "institution":
+            data = {key: data.get(key) for key in ('report_date', 'previous_report_date', 'announcement_date',
+                    'comparable_institution_change', 'coverage', 'full_institution_coverage')}
+        elif name == "dragon_tiger":
+            data = {key: data.get(key) for key in ('is_on_list', 'recent_count', 'latest_date', 'lookback_sessions',
+                    'checked_sessions', 'missing_sessions', 'coverage_complete', 'definition')}
+        if data:
+            facts[name] = {"data": data, "status": block.get("status"),
+                           "sources": [item.get("provider") for item in block.get("source_chain", []) if isinstance(item, dict)],
+                           "missing_fields": block.get("missing_fields", [])}
+    if facts:
+        parts.append("fundamental_facts=" + _serialize_untrusted_data(facts))
 
     news_items = p.dsa_news
     if not news_items:
@@ -549,6 +593,7 @@ def _format_dsa_evidence_for_prompt(payload: object) -> str:
         fields = (
             ("source", 40), ("published_date", 40), ("retrieved_at", 40),
             ("title", 80), ("snippet", 120), ("url", 120),
+            ("relevance_category", 40),
         )
         evidence.append({key: _truncate_text(str(item.get(key) or "unknown"), limit) for key, limit in fields})
     return _serialize_untrusted_data({"status": "results", "items": evidence})
@@ -574,7 +619,7 @@ def _call_llm(
     channels: list[dict[str, object]] | None = None,
     config_path: str = "",
     timeout_sec: float = 60.0,
-    max_tokens: int | None = 2048,
+    max_tokens: int | None = 8192,
 ) -> str:
     """Call LLM via litellm with fallback models and channel configs."""
     import litellm
@@ -586,6 +631,15 @@ def _call_llm(
         {"role": "system", "content": _RANKING_SYSTEM_INSTRUCTIONS},
         {"role": "user", "content": prompt},
     ]
+    from src.config import get_config
+    from src.llm.free_models import enabled as free_enabled, completion as free_completion
+    runtime_config = get_config()
+    if free_enabled(runtime_config):
+        return _extract_completion_text(free_completion(
+            runtime_config, messages=messages, model=model, timeout=timeout_sec,
+            max_tokens=max_tokens,
+            **({"response_format": {"type": "json_object"}} if json_mode else {}),
+        ))
     model_chain = _dedupe([model, *(fallback_models or [])])
     last_error: Exception | None = None
 
@@ -630,6 +684,8 @@ def _call_llm(
                 )
                 return _extract_completion_text(response)
             except Exception as exc:
+                if isinstance(exc, RankingResponseError):
+                    raise
                 last_error = exc
                 if _is_timeout_error(exc):
                     raise
@@ -648,6 +704,10 @@ def _extract_completion_text(response: object) -> str:
         message = choice.get("message") if isinstance(choice, dict) else getattr(choice, "message")
     except (AttributeError, IndexError, KeyError, TypeError):
         return ""
+
+    finish_reason = choice.get("finish_reason") if isinstance(choice, dict) else getattr(choice, "finish_reason", None)
+    if finish_reason in {"length", "max_tokens", "max_output_tokens"}:
+        raise RankingResponseError("truncated_response")
 
     def field(name: str) -> object:
         if isinstance(message, dict):
@@ -746,6 +806,9 @@ def _parse_ranking_response(response: str, candidates: list[Pick]) -> list[Pick]
 def _parse_ranking_response_detail(response: str, candidates: list[Pick]) -> RankingParseResult:
     """Parse LLM response and return diagnostics."""
     errors: list[str] = []
+    response = strip_leading_think_wrapper(response)
+    if response.lower().startswith("<think>"):
+        return RankingParseResult(candidates, 0.0, ["unclosed_think_wrapper"])
     if not response or not response.strip():
         errors.append("empty_response")
         logger.warning("Empty LLM ranking response")
@@ -978,7 +1041,7 @@ def _call_litellm_router(
     temperature: float,
     json_mode: bool,
     timeout_sec: float,
-    max_tokens: int | None = 2048,
+    max_tokens: int | None = 8192,
 ) -> str | None:
     try:
         import yaml
@@ -1017,7 +1080,7 @@ def _call_litellm_router(
             except Exception:
                 raise
     except Exception as exc:
-        if _is_timeout_error(exc):
+        if isinstance(exc, RankingResponseError) or _is_timeout_error(exc):
             raise
         logger.warning("LiteLLM router config failed, falling back to direct calls: %s", exc)
     return None
@@ -1030,12 +1093,28 @@ def _apply_screening_litellm_generation_params(
     temperature: float | None,
     model_list: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
-    return apply_litellm_generation_params(
+    result = apply_litellm_generation_params(
         call_kwargs,
         model,
         temperature,
         model_list=model_list,
     )
+    # Only the official DeepSeek endpoint has a verified switch contract.
+    # Keep reasoning choices for other providers and other analysis tasks intact.
+    def verified_target(target):
+        host = urlparse(str(target.get("api_base") or "")).hostname
+        wire_model = str(target.get("model") or "").lower()
+        return host == "api.deepseek.com" and any(name in wire_model for name in ("deepseek-v4", "deepseek-flash", "deepseek-pro"))
+
+    targets = [row.get("litellm_params") or {} for row in (model_list or [])
+               if isinstance(row, dict) and row.get("model_name") == model]
+    official_only = verified_target(result) or (bool(targets) and all(verified_target(target) for target in targets))
+    if official_only:
+        result.pop("reasoning_effort", None)
+        extra = dict(result.get("extra_body") or {})
+        extra["thinking"] = {"type": "disabled"}
+        result["extra_body"] = extra
+    return result
 
 
 def _call_screening_litellm_completion(

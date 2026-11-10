@@ -54,6 +54,7 @@ class LoadedPrices:
     requested_start: date
     failed: Dict[str, str] = field(default_factory=dict)
     sources: Dict[str, str] = field(default_factory=dict)
+    rejected: Dict[str, List[str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -63,6 +64,21 @@ class RotationReport:
     target_weights: Dict[str, float] = field(default_factory=dict)
     failed_codes: Dict[str, str] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
+    data_quality: str = 'ok'
+    sources: Dict[str, str] = field(default_factory=dict)
+
+
+def _abnormal_moves(series: pd.Series) -> pd.Series:
+    moves = series.dropna().pct_change(fill_method=None)
+    return moves[moves.abs() > SUSPICIOUS_DAILY_MOVE]
+
+
+def _jump_description(code: str, series: pd.Series) -> Optional[str]:
+    jumps = _abnormal_moves(series)
+    if jumps.empty:
+        return None
+    listed = '、'.join(f'{d:%Y-%m-%d} {v * 100:+.0f}%' for d, v in jumps.head(MAX_LISTED_JUMPS).items())
+    return f'{code} 存在异常价格跳变（{listed}），须核验拆分/复权后重新计算'
 
 
 def params_from_config(config) -> RotationParams:
@@ -93,58 +109,97 @@ def _close_series(code: str, df: Optional[pd.DataFrame], end_day: date) -> pd.Se
     return kept
 
 
+def _load_adjusted_history(manager, code: str, start_day: date, end_day: date, source: str):
+    """Tencent caps a response at 800 bars; annual pages avoid a truncated backtest."""
+    if source != 'TencentFetcher':
+        return manager.get_daily_data(code, start_date=start_day.isoformat(), end_date=end_day.isoformat())
+    frames = []
+    cursor = start_day
+    while cursor <= end_day:
+        page_end = min(cursor + timedelta(days=365), end_day)
+        frame, actual_source = manager.get_daily_data(code, start_date=cursor.isoformat(), end_date=page_end.isoformat())
+        if frame is None or frame.empty or frame.attrs.get('price_adjustment') != 'forward':
+            raise ValueError(f'Tencent page {cursor}~{page_end} does not confirm forward-adjusted prices')
+        frames.append(frame)
+        cursor = page_end + timedelta(days=1)
+    return pd.concat(frames, ignore_index=True), actual_source
+
+
 def load_closes(
     fetcher_manager,
     codes: Sequence[str],
     years: int,
     end: Optional[date] = None,
+    *,
+    safe_errors: bool = False,
 ) -> LoadedPrices:
     """Fetch daily closes per code; failures are returned, not swallowed.
 
     Bars after ``end`` (e.g. an unfinished intraday bar) are dropped. Reindex
     against actual A-share sessions through ``end``; missing quotes stay NaN.
     An unavailable historical calendar raises rather than inventing sessions.
+    ``safe_errors`` replaces provider exception details with fixed codes only
+    for this synchronous request, including shared manager/base error logs.
     """
+    from data_provider.base import safe_exception_details
+
+    with safe_exception_details(enabled=safe_errors) as safe_errors:
+        return _load_closes(fetcher_manager, codes, years, end, safe_errors)
+
+
+def _load_closes(fetcher_manager, codes, years, end, safe_errors):
     end_day = end or date.today()
     start_day = end_day - timedelta(days=int(years * 365.25))
     series: Dict[str, pd.Series] = {}
     failed: Dict[str, str] = {}
     sources: Dict[str, str] = {}
+    rejected: Dict[str, List[str]] = {}
 
-    from data_provider.base import DataFetcherManager, _is_etf_code
+    from data_provider.base import DataFetcherManager, _is_etf_code, summarize_exception
 
     # Keep the existing priority/fallback manager, but give this consumer a
     # request-local list whose ETF paths explicitly request forward adjustment.
     # Never change the shared manager or quietly use raw-price fallback sources.
-    adjusted_manager = None
+    adjusted_managers = []
     if isinstance(fetcher_manager, DataFetcherManager):
         eligible = [
             fetcher for fetcher in fetcher_manager._get_fetchers_snapshot()
-            if fetcher.name in {"EfinanceFetcher", "AkshareFetcher", "BaostockFetcher"}
+            if fetcher.name in {"EfinanceFetcher", "AkshareFetcher", "BaostockFetcher", "TencentFetcher"}
             or (fetcher.name == "TickFlowFetcher" and fetcher.kline_adjust == "forward")
         ]
-        if eligible:
-            adjusted_manager = DataFetcherManager(fetchers=eligible)
+        adjusted_managers = [DataFetcherManager(fetchers=[fetcher]) for fetcher in eligible]
 
     for code in codes:
         try:
             if isinstance(fetcher_manager, DataFetcherManager):
                 if not _is_etf_code(code):
                     raise ValueError("rotation requires an A-share ETF code")
-                if adjusted_manager is None:
+                if not adjusted_managers:
                     raise ValueError("no forward-adjusted ETF data source available")
-            manager = adjusted_manager or fetcher_manager
-            df, source = manager.get_daily_data(
-                code,
-                start_date=start_day.isoformat(),
-                end_date=end_day.isoformat(),
-            )
-            close_series = _close_series(code, df, end_day)
-            if adjusted_manager is None and df.attrs.get("price_adjustment") != "forward":
-                raise ValueError("daily source does not confirm forward-adjusted prices")
-            series[code] = close_series
+            attempts = []
+            for manager in adjusted_managers or [fetcher_manager]:
+                source = 'injected_provider'
+                if isinstance(manager, DataFetcherManager):
+                    source = manager._get_fetchers_snapshot()[0].name
+                try:
+                    df, source = _load_adjusted_history(manager, code, start_day, end_day, source)
+                    close_series = _close_series(code, df, end_day)
+                    if not adjusted_managers and df.attrs.get('price_adjustment') != 'forward':
+                        raise ValueError('daily source does not confirm forward-adjusted prices')
+                    problem = _jump_description(code, close_series)
+                    if problem:
+                        raise ValueError(problem)
+                    series[code] = close_series
+                    break
+                except Exception as exc:
+                    detail = summarize_exception(exc)[1] if safe_errors else str(exc) or type(exc).__name__
+                    attempts.append(f'{source}: {detail}')
+            if attempts:
+                rejected[code] = attempts
+            if code not in series:
+                raise ValueError('; '.join(attempts))
         except Exception as exc:  # fetch errors and malformed frames alike
-            failed[code] = str(exc) or type(exc).__name__
+            failed[code] = summarize_exception(exc)[1] if safe_errors else str(exc) or type(exc).__name__
             logger.warning("[ETF轮动] %s 日线不可用: %s", code, failed[code])
             continue
         sources[code] = source
@@ -160,15 +215,18 @@ def load_closes(
         # Keep sessions even when every source omits the date; otherwise missing
         # execution days become delayed trades and missing Fridays shift signals.
         frame = frame.reindex(sessions)
-    return LoadedPrices(closes=frame, requested_start=start_day, failed=failed, sources=sources)
+    return LoadedPrices(closes=frame, requested_start=start_day, failed=failed, sources=sources, rejected=rejected)
 
 
 def data_quality_warnings(loaded: LoadedPrices) -> List[str]:
     """Surface data issues that silently distort a backtest."""
     warnings: List[str] = [
-        f"{code} 数据获取失败，已从本次计算中剔除（{reason[:60]}）"
+        f"{code} 数据获取失败，原策略候选池不完整（{reason[:160]}）"
         for code, reason in loaded.failed.items()
     ]
+    for code, attempts in loaded.rejected.items():
+        if code in loaded.sources:
+            warnings.append(f"{code} 已回退至 {loaded.sources[code]}；此前未通过的数据源：{'；'.join(attempts)[:240]}")
     limit = pd.Timestamp(loaded.requested_start) + pd.Timedelta(days=TRUNCATED_HISTORY_TOLERANCE_DAYS)
     for code in loaded.closes.columns:
         series = loaded.closes[code].dropna()
@@ -356,6 +414,23 @@ def build_report(
     next_session: Optional[NextSessionFn] = None,
 ) -> RotationReport:
     """Render the report; ``next_session`` resolves the trading day after a date."""
+    blocking = [f'{code} 缺少历史数据，不能将缩小后的池视作原策略' for code in risk_assets
+                if code not in closes.columns or closes[code].dropna().empty]
+    if safe_asset and (safe_asset not in closes.columns or closes[safe_asset].dropna().empty):
+        blocking.append(f'防守资产 {safe_asset} 不可用，不能擅自替换为现金后发布原策略指标')
+    for code in dict.fromkeys([*risk_assets, *([safe_asset] if safe_asset else [])]):
+        if code in closes.columns:
+            problem = _jump_description(code, closes[code])
+            if problem:
+                blocking.append(problem)
+    if blocking:
+        as_of = closes.index.max() if not closes.empty else None
+        notes = list(warnings) + blocking
+        lines = ['# ETF 轮动研究：数据验收未通过', '',
+                 '已暂停本次正式策略目标、收益指标和参数比较；不代表策略无效，也不建议按不完整数据调仓。', '']
+        lines += [f'- {note}' for note in notes]
+        return RotationReport(markdown='\n'.join(lines) + '\n', as_of=as_of,
+                              warnings=notes, data_quality='blocked')
     risk = [c for c in risk_assets if c in closes.columns]
     result = run_backtest(closes, risk, safe_asset, params)
     as_of, ranking = latest_ranking(closes, risk, params)
@@ -404,6 +479,7 @@ def build_report(
         as_of=as_of,
         target_weights=target,
         warnings=notes,
+        data_quality='partial' if notes else 'ok',
     )
 
 
@@ -478,9 +554,12 @@ def run_etf_rotation(
     for warning in warnings:
         logger.warning("[ETF轮动] %s", warning)
     report = replace(
-        build_report(loaded.closes, risk, safe_asset, params, names, warnings, next_session=next_session),
+        build_report(loaded.closes, pool, safe_asset, params, names, warnings, next_session=next_session),
         failed_codes=dict(loaded.failed),
+        sources=dict(loaded.sources),
     )
+    source_note = '\n> 历史行情来源：' + '；'.join(f'{code}={source}' for code, source in loaded.sources.items()) + '\n'
+    report = replace(report, markdown=report.markdown + source_note)
 
     _deliver(report, send_notification, notifier)
     return report

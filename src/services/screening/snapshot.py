@@ -26,7 +26,6 @@ from src.services.screening.source_guard import call_with_timeout, parse_source_
 logger = logging.getLogger(__name__)
 
 _SNAPSHOT_CACHE_VERSION = 1
-_DEFAULT_TUSHARE_HTTP_URL = "http://api.waditu.com"
 _EM_REQUEST_MIN_INTERVAL_SECONDS = 1.0
 _EM_REQUEST_JITTER_SECONDS = 0.3
 _SOURCE_HEALTH_FAILURE_THRESHOLD = 3
@@ -37,6 +36,62 @@ _EM_LAST_REQUEST_AT = 0.0
 _EM_LOCK = threading.Lock()
 _SOURCE_HEALTH: dict[str, dict[str, object]] = {}
 _SOURCE_HEALTH_LOCK = threading.Lock()
+_INDUSTRY_CACHE: dict[str, object] = {}
+_INDUSTRY_LOCK = threading.Lock()
+
+
+def _supplement_snapshot_industry(frame: pd.DataFrame) -> None:
+    """Fill only absent industry labels, with one bounded daily reference request."""
+    if "code" not in frame:
+        return
+    values = frame.get("industry", pd.Series("", index=frame.index)).fillna("").astype(str).str.strip()
+    missing = values.isin(["", "nan", "None", "unknown"])
+    token = os.getenv("TUSHARE_TOKEN", "").strip() or os.getenv("TUSHARE_API_TOKEN", "").strip()
+    if not missing.any() or not token:
+        return
+    with _INDUSTRY_LOCK:
+        now = time.monotonic()
+        if now >= float(_INDUSTRY_CACHE.get("expires", 0)):
+            try:
+                from data_provider.tushare_fetcher import create_tushare_http_client
+                table = create_tushare_http_client(token, timeout=3).stock_basic(
+                    exchange="", list_status="L", fields="ts_code,industry")
+                if table is None or table.empty or not {"ts_code", "industry"}.issubset(table.columns):
+                    raise ValueError("industry reference unavailable")
+                table = table.dropna(subset=["ts_code", "industry"])
+                mapping = dict(zip(table.ts_code.astype(str).str.split(".").str[0], table.industry.astype(str)))
+                _INDUSTRY_CACHE.update(mapping=mapping, expires=now+86400,
+                                       fetched_at=datetime.now(timezone.utc).isoformat())
+            except Exception as exc:
+                _INDUSTRY_CACHE.update(mapping={}, expires=now+60)
+                frame.attrs.setdefault("data_warnings", []).append(f"industry reference unavailable: {type(exc).__name__}")
+        mapping = dict(_INDUSTRY_CACHE.get("mapping", {}))
+        acquired = _INDUSTRY_CACHE.get("fetched_at")
+    labels = frame["code"].astype(str).str.zfill(6).map(mapping)
+    usable = missing & labels.notna() & labels.ne("")
+    if usable.any():
+        frame["industry"] = values
+        frame.loc[usable, "industry"] = labels.loc[usable]
+        frame["industry_source"] = frame.get("industry_source", pd.Series("", index=frame.index))
+        frame.loc[usable, "industry_source"] = "tushare:stock_basic"
+        frame.attrs["industry_reference_fetched_at"] = acquired
+
+
+def _annotate_snapshot_data_dates(frame: pd.DataFrame) -> None:
+    """Acquisition time is not proof that every provider field is from today."""
+    dates = {}
+    warnings = list(frame.attrs.get("data_warnings", []))
+    for column in ("MAX_TRADE_DATE", "trade_date", "daily_basic_trade_date"):
+        if column not in frame:
+            continue
+        stamps = pd.to_datetime(frame[column].astype(str), errors="coerce").dropna()
+        if stamps.empty:
+            warnings.append(f"快照 {column} 无法解析，业务日期未知")
+            continue
+        dates[column] = str(stamps.max().date())
+        warnings.append(f"快照 {column}={dates[column]}；抓取时间不等于业务日期，未核实字段不能视为当日实时数据")
+    frame.attrs["snapshot_data_dates"] = dates
+    frame.attrs["data_warnings"] = list(dict.fromkeys(warnings))
 
 
 def fetch_cn_snapshot(source: str = "efinance") -> pd.DataFrame:
@@ -87,6 +142,8 @@ def fetch_snapshot_with_fallback(
             requested_snapshot_sources=sources,
         )
         if cached is not None:
+            _supplement_snapshot_industry(cached)
+            _annotate_snapshot_data_dates(cached)
             return cached
 
     for source in sources:
@@ -108,6 +165,8 @@ def fetch_snapshot_with_fallback(
                 df.attrs["fallback_used"] = False
                 df.attrs["stale"] = False
                 df.attrs["stale_age_hours"] = None
+                _supplement_snapshot_industry(df)
+                _annotate_snapshot_data_dates(df)
                 _write_last_good_snapshot(
                     fallback_snapshot_path,
                     df,
@@ -130,6 +189,8 @@ def fetch_snapshot_with_fallback(
         max_age_hours=fallback_max_age_hours,
     )
     if cached is not None:
+        _supplement_snapshot_industry(cached)
+        _annotate_snapshot_data_dates(cached)
         return cached
 
     raise RuntimeError(f"All snapshot sources failed: {'; '.join(errors)}")
@@ -259,6 +320,9 @@ def _write_last_good_snapshot(
             "created_at": datetime.now(timezone.utc).isoformat(),
             "metadata": {
                 "snapshot_source": str(df.attrs.get("snapshot_source", "")),
+                "data_warnings": list(df.attrs.get("data_warnings", [])),
+                "snapshot_data_dates": df.attrs.get("snapshot_data_dates", {}),
+                "industry_reference_fetched_at": df.attrs.get("industry_reference_fetched_at"),
                 "source_priority": [
                     str(source).strip()
                     for source in (source_priority or [])
@@ -266,6 +330,11 @@ def _write_last_good_snapshot(
                 ],
                 "row_count": int(len(df)),
                 "columns": list(df.columns),
+                **{
+                    key: df.attrs[key]
+                    for key in ("units_profile", "pe_ratio_basis", "field_trade_date_columns")
+                    if key in df.attrs
+                },
             },
             "frame": json.loads(
                 df.to_json(orient="split", date_format="iso", force_ascii=False)
@@ -368,6 +437,12 @@ def _read_last_good_snapshot(
     )
     if isinstance(metadata, dict):
         cached.attrs["last_good_created_at"] = str(payload.get("created_at", ""))
+        for key in (
+            "data_warnings", "snapshot_data_dates", "industry_reference_fetched_at",
+            "units_profile", "pe_ratio_basis", "field_trade_date_columns",
+        ):
+            if key in metadata:
+                cached.attrs[key] = metadata[key]
     if fresh:
         logger.info(
             "Using fresh snapshot cache %s: age_hours=%s rows=%d",
@@ -590,18 +665,23 @@ def _fetch_tushare() -> pd.DataFrame:
     if not token:
         raise RuntimeError("tushare requires TUSHARE_TOKEN")
 
-    import tushare as ts
+    from data_provider.tushare_fetcher import create_tushare_http_client
 
-    pro = ts.pro_api(token)
-    _configure_tushare_client(pro, token=token)
+    pro = create_tushare_http_client(token)
     trade_date = _resolve_tushare_trade_date(pro)
-    daily = pro.daily(
-        trade_date=trade_date,
-        fields="ts_code,trade_date,close,pct_chg,amount",
-    )
+    daily = None
+    for _ in range(3):
+        daily = pro.daily(trade_date=trade_date, fields="ts_code,trade_date,close,pct_chg,amount")
+        if daily is not None and not daily.empty:
+            break
+        if os.getenv("TUSHARE_TRADE_DATE", "").strip():
+            break  # An explicit replay date must never silently move.
+        trade_date = _resolve_tushare_trade_date(pro, before_date=trade_date)
+    if daily is None or daily.empty:
+        raise RuntimeError(f"tushare daily returned empty data for {trade_date}")
     daily_basic = pro.daily_basic(
         trade_date=trade_date,
-        fields="ts_code,turnover_rate,volume_ratio,pe,pb,total_mv,circ_mv",
+        fields="ts_code,trade_date,turnover_rate,volume_ratio,pe_ttm,pb,total_mv,circ_mv",
     )
     stock_basic = pro.stock_basic(
         exchange="",
@@ -617,30 +697,13 @@ def _fetch_tushare() -> pd.DataFrame:
     return _prepare_tushare_snapshot(daily, daily_basic, stock_basic)
 
 
-def _configure_tushare_client(pro: object, *, token: str) -> None:
-    try:
-        setattr(pro, "_DataApi__token", token)
-    except Exception:
-        pass
-
-    http_url = (
-        os.getenv("TUSHARE_API_URL", "").strip()
-        or os.getenv("TUSHARE_HTTP_URL", "").strip()
-        or _DEFAULT_TUSHARE_HTTP_URL
-    )
-    try:
-        setattr(pro, "_DataApi__http_url", http_url)
-    except Exception:
-        pass
-
-
-def _resolve_tushare_trade_date(pro) -> str:
+def _resolve_tushare_trade_date(pro, *, before_date: str | None = None) -> str:
     """Return the latest open trade date for Tushare requests."""
     explicit = os.getenv("TUSHARE_TRADE_DATE", "").strip()
-    if explicit:
+    if explicit and before_date is None:
         return explicit
 
-    end = date.today()
+    end = datetime.strptime(before_date, "%Y%m%d").date() - timedelta(days=1) if before_date else date.today()
     start = end - timedelta(days=30)
     calendar = pro.trade_cal(
         exchange="",
@@ -658,16 +721,41 @@ def _prepare_tushare_snapshot(
     daily: pd.DataFrame,
     daily_basic: pd.DataFrame,
     stock_basic: pd.DataFrame | None,
+    *,
+    preserve_invalid_rows: bool = False,
 ) -> pd.DataFrame:
     """Join and unit-normalize Tushare tables into the common snapshot schema."""
-    merged = daily.merge(daily_basic, on="ts_code", how="left")
+    for label, table in (("daily", daily), ("daily_basic", daily_basic), ("stock_basic", stock_basic)):
+        if table is None:
+            continue
+        if not table.columns.is_unique:
+            raise ValueError(f"tushare {label} has duplicate columns")
+        if table.empty and label == "stock_basic":
+            continue
+        if "ts_code" not in table or table["ts_code"].isna().any() or not table["ts_code"].is_unique:
+            raise ValueError(f"tushare {label} requires non-null unique ts_code")
+        if "symbol" in table:
+            canonical = table["ts_code"].astype(str).str.split(".").str[0]
+            conflicts = table["symbol"].notna() & table["symbol"].astype(str).ne(canonical)
+            if conflicts.any():
+                raise ValueError(f"tushare {label} symbol conflicts with ts_code")
+
+    # Each endpoint owns only these fields. Missing fields remain missing evidence.
+    quotes = daily.reindex(columns=["ts_code", "trade_date", "close", "pct_chg", "amount"]).copy()
+    basics = daily_basic.reindex(columns=[
+        "ts_code", "trade_date", "turnover_rate", "volume_ratio", "pe_ttm", "pb", "total_mv", "circ_mv", "dv_ttm",
+    ]).copy().rename(columns={"trade_date": "daily_basic_trade_date"})
+    join = "outer" if preserve_invalid_rows else "left"
+    merged = quotes.merge(basics, on="ts_code", how=join, validate="one_to_one")
     if stock_basic is not None and not stock_basic.empty:
-        merged = merged.merge(stock_basic, on="ts_code", how="left")
-    if "symbol" not in merged.columns:
-        merged["symbol"] = merged["ts_code"].astype(str).str.split(".").str[0]
-    else:
-        fallback_symbol = merged["ts_code"].astype(str).str.split(".").str[0]
-        merged["symbol"] = merged["symbol"].fillna(fallback_symbol)
+        reference = stock_basic.reindex(columns=["ts_code", "name", "industry"]).copy()
+        merged = merged.merge(reference, on="ts_code", how=join, validate="one_to_one")
+    if preserve_invalid_rows:
+        identities = pd.concat([table["ts_code"] for table in (daily, daily_basic, stock_basic)
+                                if table is not None and "ts_code" in table]).drop_duplicates()
+        merged = merged.set_index("ts_code").reindex(identities).reset_index()
+    merged["code"] = merged["ts_code"].astype(str).str.split(".").str[0]
+    normalized = _normalize(merged, source="tushare", preserve_invalid_rows=preserve_invalid_rows)
 
     # Tushare units: amount is thousand yuan; market caps are ten-thousand yuan.
     for col, multiplier in {
@@ -675,13 +763,24 @@ def _prepare_tushare_snapshot(
         "total_mv": 10000,
         "circ_mv": 10000,
     }.items():
-        if col in merged.columns:
-            merged[col] = pd.to_numeric(merged[col], errors="coerce") * multiplier
+        normalized[col] = normalized[col] * multiplier
 
-    return _normalize(merged, source="tushare")
+    normalized.attrs["units_profile"] = "cn_equity_cny_v1"
+    normalized.attrs["pe_ratio_basis"] = "ttm"
+    normalized['dividend_yield_ttm_pct'] = pd.to_numeric(normalized['dv_ttm'].mask(
+        normalized['dv_ttm'].map(lambda value: pd.api.types.is_bool(value) or isinstance(value, date))), errors='coerce')
+    normalized.attrs['dividend_yield_ttm_unit'] = 'percent'
+    normalized.attrs["field_trade_date_columns"] = {
+        "price": "trade_date", "change_pct": "trade_date", "amount": "trade_date",
+        "pe_ratio": "daily_basic_trade_date", "pb_ratio": "daily_basic_trade_date",
+        "total_mv": "daily_basic_trade_date", "circ_mv": "daily_basic_trade_date",
+        "turnover_rate": "daily_basic_trade_date", "volume_ratio": "daily_basic_trade_date",
+        "dividend_yield_ttm_pct": "daily_basic_trade_date",
+    }
+    return normalized
 
 
-def _normalize(df: pd.DataFrame, source: str) -> pd.DataFrame:
+def _normalize(df: pd.DataFrame, source: str, *, preserve_invalid_rows: bool = False) -> pd.DataFrame:
     """Normalize column names to a standard schema.
 
     Standard columns: code, name, price, change_pct, amount, total_mv,
@@ -752,14 +851,14 @@ def _normalize(df: pd.DataFrame, source: str) -> pd.DataFrame:
         }
     elif source == "tushare":
         standard_cols = {
-            "code": ["symbol", "code"],
+            "code": ["code", "symbol"],
             "name": ["name"],
             "price": ["close"],
             "change_pct": ["pct_chg"],
             "amount": ["amount"],
             "total_mv": ["total_mv"],
             "circ_mv": ["circ_mv"],
-            "pe_ratio": ["pe"],
+            "pe_ratio": ["pe_ttm"],
             "pb_ratio": ["pb"],
             "volume_ratio": ["volume_ratio"],
             "turnover_rate": ["turnover_rate"],
@@ -778,10 +877,14 @@ def _normalize(df: pd.DataFrame, source: str) -> pd.DataFrame:
     ]
     for col in numeric_cols:
         if col in df.columns:
+            if source == "tushare":
+                # Datetime dtypes otherwise become finite nanosecond integers.
+                invalid = df[col].map(lambda value: pd.api.types.is_bool(value) or isinstance(value, date))
+                df[col] = df[col].astype(object).mask(invalid)
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
     # Drop rows without a valid price
-    if "price" in df.columns:
+    if "price" in df.columns and not preserve_invalid_rows:
         df = df.dropna(subset=["price"])
         df = df[df["price"] > 0]
 

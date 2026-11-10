@@ -4,11 +4,31 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, Optional
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 
 from src.schemas.decision_scale import signal_key_for_score
 
 SUPPORTED_REPORT_LANGUAGES = ("zh", "en", "ko")
+
+
+def market_snapshot_presentation(snapshot: Dict[str, Any], language: str = 'zh') -> Dict[str, str]:
+    """Shared evidence labels for Web history, built-in reports and Jinja templates."""
+    language = normalize_report_language(language)
+    latest = snapshot.get('is_partial_bar') is True or (
+        bool(snapshot.get('provider_timestamp')) and snapshot.get('is_partial_bar') is None)
+    heading, latest_label, partial_label, daily_label = {
+        'zh': ('行情快照', '最新价', '盘中 / 非完整交易日', '日线 / 日终快照'),
+        'en': ('Market Snapshot', 'Latest price', 'intraday / incomplete session', 'daily / session snapshot'),
+        'ko': ('시장 스냅샷', '최근 가격', '장중 / 미완료 세션', '일봉 / 종가 스냅샷'),
+    }[language]
+    evidence = (f"as_of={snapshot.get('date') or 'unknown'}; "
+                f"provider_timestamp={snapshot.get('provider_timestamp') or 'unknown'}; "
+                f"date_basis={snapshot.get('date_basis') or 'unknown'}; "
+                f"source={snapshot.get('source') or 'unknown'}; "
+                + (partial_label if latest else daily_label))
+    return {'heading': heading, 'evidence': evidence,
+            'price_label': latest_label if latest else get_report_labels(language)['close_label']}
 
 _REPORT_LANGUAGE_ALIASES = {
     "zh-cn": "zh",
@@ -494,6 +514,24 @@ _REPORT_LABELS: Dict[str, Dict[str, str]] = {
         "strategy_supporting_skills_label": "支持策略",
         "strategy_opposing_skills_label": "反方策略",
         "strategy_invalid_opinions_label": "另有 {count} 个策略解析失败",
+        # --- 推送可读性优化（新手友好 / 免责 / 时效 / 准确率） ---
+        "newcomer_guide_heading": "30 秒看懂这份报告",
+        "newcomer_guide_line1": "① 先看每只股票的打分和一句话决策——打分 0-100，越高代表模型越看好，但它是概率参考，不是涨跌承诺；",
+        "newcomer_guide_line2": "② 打算操作的朋友，重点看「作战计划」里的四个价位：理想买入、次优买入、止损、目标——纪律比预测重要；",
+        "newcomer_guide_line3": "③ 看不懂或者心里没底的时候，不做就是最好的操作。",
+        "score_plainly_label": "大白话",
+        "disclaimer_line": "⚠️ 本报告由 AI 生成，仅供参考，不构成投资建议；行情数据可能存在延迟或错误，请以交易所终端数据为准。",
+        "data_as_of_label": "数据截至",
+        "accuracy_label": "历史准确率",
+        "accuracy_pending": "样本积累中——每笔研判都会在约 10 个交易日后回溯评分，样本足够后在此展示",
+        "alert_signal_heading": "预警触发",
+        "alert_target_label": "标的",
+        "alert_observed_label": "当前值",
+        "alert_threshold_label": "触发条件",
+        "alert_rule_label": "规则",
+        "alert_data_as_of_label": "数据时间",
+        "alert_ai_label": "AI 简评",
+        "alert_newcomer_hint": "预警只是提醒你「到点了，该打开看看」，不代表一定涨跌，决策还是要自己做。",
     },
     "en": {
         "dashboard_title": "Decision Dashboard",
@@ -629,6 +667,24 @@ _REPORT_LABELS: Dict[str, Dict[str, str]] = {
         "strategy_supporting_skills_label": "Supporting Strategies",
         "strategy_opposing_skills_label": "Opposing Strategies",
         "strategy_invalid_opinions_label": "{count} additional strategies failed to produce valid signals",
+        # --- Push readability (newcomer friendly / disclaimer / data-as-of / accuracy) ---
+        "newcomer_guide_heading": "Read this report in 30 seconds",
+        "newcomer_guide_line1": "1) Start with each stock's score and one-line decision - score runs 0-100, higher means more bullish, but it is a probability hint, not a promise;",
+        "newcomer_guide_line2": "2) If you plan to trade, focus on the four prices under Battle Plan: ideal entry, secondary entry, stop loss, target - discipline beats prediction;",
+        "newcomer_guide_line3": "3) When in doubt, doing nothing is the best trade.",
+        "score_plainly_label": "In plain words",
+        "disclaimer_line": "AI-generated content for reference only. Not investment advice. Market data may be delayed or inaccurate; always check your exchange terminal.",
+        "data_as_of_label": "Data as of",
+        "accuracy_label": "Historical accuracy",
+        "accuracy_pending": "Collecting samples - every call is back-tested about 10 trading days later; shown here once the sample is sufficient",
+        "alert_signal_heading": "Alert triggered",
+        "alert_target_label": "Target",
+        "alert_observed_label": "Current",
+        "alert_threshold_label": "Trigger",
+        "alert_rule_label": "Rule",
+        "alert_data_as_of_label": "Data time",
+        "alert_ai_label": "AI note",
+        "alert_newcomer_hint": "An alert only means it is time to take a look - it does not predict direction. The decision is yours.",
     },
     "ko": {
         "dashboard_title": "결정 대시보드",
@@ -764,6 +820,24 @@ _REPORT_LABELS: Dict[str, Dict[str, str]] = {
         "strategy_supporting_skills_label": "지지 전략",
         "strategy_opposing_skills_label": "반대 전략",
         "strategy_invalid_opinions_label": "추가로 {count}개 전략이 유효한 신호를 생성하지 못했습니다",
+        # --- 알림 가독성 (초보자 친화 / 면책 / 데이터 시점 / 적중률) ---
+        "newcomer_guide_heading": "30초 만에 읽는 리포트",
+        "newcomer_guide_line1": "1) 종목별 점수와 한 줄 결론부터 보세요. 점수는 0-100이며 높을수록 긍정적이지만 확률 참고치일 뿐, 등락 보장은 아닙니다;",
+        "newcomer_guide_line2": "2) 매매를 고려한다면 '작전 계획'의 네 가지 가격(이상 매수/차선 매수/손절/목표)을 확인하세요. 규칙이 예측보다 중요합니다;",
+        "newcomer_guide_line3": "3) 이해가 안 되거나 확신이 없으면, 하지 않는 것이 최선입니다.",
+        "score_plainly_label": "쉬운 해석",
+        "disclaimer_line": "본 리포트는 AI가 생성한 참고 자료이며 투자 권유가 아닙니다. 시세 데이터는 지연되거나 오류가 있을 수 있으니 거래소 단말기를 확인하세요.",
+        "data_as_of_label": "데이터 기준",
+        "accuracy_label": "과거 적중률",
+        "accuracy_pending": "표본 축적 중 - 모든 판단은 약 10영업일 후 소급 평가되며, 표본이 충분해지면 여기에 표시됩니다",
+        "alert_signal_heading": "알림 발생",
+        "alert_target_label": "종목",
+        "alert_observed_label": "현재값",
+        "alert_threshold_label": "발동 조건",
+        "alert_rule_label": "규칙",
+        "alert_data_as_of_label": "데이터 시각",
+        "alert_ai_label": "AI 한줄 평",
+        "alert_newcomer_hint": "알림은 '이제 한번 볼 시간'이라는 뜻일 뿐, 등락을 예측하지 않습니다. 결정은 본인의 몫입니다.",
     },
 }
 
@@ -833,6 +907,88 @@ def get_report_labels(language: Optional[str]) -> Dict[str, str]:
     """Return UI copy for the selected report language."""
     normalized = normalize_report_language(language)
     return _REPORT_LABELS[normalized]
+
+
+# --- 推送可读性助手（模板与 Python 渲染路径共用） ---
+
+_SENTIMENT_PLAIN_BANDS: Dict[str, List[tuple]] = {
+    "zh": [
+        (80, "强烈看多——多个信号同向，但也别追高"),
+        (65, "偏多——优势在多方，但还没到一边倒"),
+        (50, "中性略偏多——可以留意，等更明确的信号"),
+        (35, "中性——多空力量均衡，观望为宜"),
+        (20, "偏空——空方占优，谨慎对待"),
+        (0, "强烈看空——风险信号集中，先避开"),
+    ],
+    "en": [
+        (80, "Strongly bullish - signals align, but do not chase"),
+        (65, "Leaning bullish - bulls lead, but it is not one-sided"),
+        (50, "Neutral to slightly bullish - worth watching for a clearer signal"),
+        (35, "Neutral - balanced forces, staying out is fine"),
+        (20, "Leaning bearish - bears lead, be cautious"),
+        (0, "Strongly bearish - risk signals cluster, step aside first"),
+    ],
+    "ko": [
+        (80, "강한 상승 - 신호가 같은 방향이지만 추격 매수는 금물"),
+        (65, "상승 우세 - 상승 쪽이 유리하지만 일방적이지 않음"),
+        (50, "중립~약간 상승 - 더 명확한 신호를 기다릴 만함"),
+        (35, "중립 - 힘이 균형을 이루므로 관망이 적절"),
+        (20, "하락 우세 - 하락 쪽이 유리하므로 신중할 것"),
+        (0, "강한 하락 - 위험 신호가 집중, 일단 거리를 둘 것"),
+    ],
+}
+
+
+def describe_sentiment_plainly(score: Any, language: Optional[str] = "zh") -> str:
+    """Return a plain-language reading of a 0-100 sentiment score.
+
+    Returns an empty string when the score is missing or not numeric, so
+    callers can omit the line entirely instead of rendering a placeholder.
+    """
+    try:
+        value = float(score)
+    except (TypeError, ValueError):
+        return ""
+    bands = _SENTIMENT_PLAIN_BANDS.get(normalize_report_language(language), _SENTIMENT_PLAIN_BANDS["zh"])
+    for threshold, text in bands:
+        if value >= threshold:
+            return text
+    return bands[-1][1]
+
+
+def newcomer_guide_lines(language: Optional[str]) -> List[str]:
+    """Return the three-line newcomer guide shown at the top of a report."""
+    labels = get_report_labels(language)
+    return [
+        labels["newcomer_guide_line1"],
+        labels["newcomer_guide_line2"],
+        labels["newcomer_guide_line3"],
+    ]
+
+
+def report_disclaimer_line(language: Optional[str]) -> str:
+    """Return the standard disclaimer line for pushed reports."""
+    return get_report_labels(language)["disclaimer_line"]
+
+
+def report_data_as_of_line(language: Optional[str], now: Optional[datetime] = None) -> str:
+    """Return a timezone-explicit data-as-of line (ISO 8601 with offset)."""
+    labels = get_report_labels(language)
+    moment = now if now is not None else datetime.now().astimezone()
+    if moment.tzinfo is None:
+        moment = moment.astimezone()
+    return f"{labels['data_as_of_label']}：{moment.isoformat(timespec='seconds')}"
+
+
+def report_accuracy_line(language: Optional[str]) -> str:
+    """Return the historical-accuracy line.
+
+    The outcome evaluation loop writes samples asynchronously; when no sample
+    is available yet the line says so explicitly instead of hiding the field
+    or fabricating a number.
+    """
+    labels = get_report_labels(language)
+    return f"{labels['accuracy_label']}：{labels['accuracy_pending']}"
 
 
 def get_placeholder_text(language: Optional[str]) -> str:

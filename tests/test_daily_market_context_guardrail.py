@@ -7,6 +7,43 @@ from src.analyzer import AnalysisResult
 from src.daily_market_context_guardrail import apply_daily_market_context_guardrail
 
 
+def test_guardrail_final_text_and_score_match_with_original_preserved() -> None:
+    result = _result()
+    result.analysis_summary = "宜轻仓回踩买入，趋势评分82分。"
+    result.buy_reason = "建议立即买入"
+    result.dashboard["analysis_summary"] = result.analysis_summary
+    result.dashboard["sentiment_score"] = 31
+    result.dashboard["phase_decision"].update(
+        immediate_action="立即买入", action_window="buy_now",
+        watch_conditions=["风险缓解后重新评估"],
+    )
+    context = {"risk_tags": ["high_risk"]}
+    apply_daily_market_context_guardrail(result, daily_market_context=context)
+    assert "最终建议：观望" in result.analysis_summary
+    assert "回踩买入" not in result.analysis_summary
+    assert result.buy_reason == result.analysis_summary
+    assert result.dashboard["analysis_summary"] == result.analysis_summary
+    assert result.dashboard["sentiment_score"] == result.sentiment_score
+    assert result.dashboard["phase_decision"]["action_window"] == "wait"
+    assert "暂不开新仓" in result.dashboard["phase_decision"]["immediate_action"]
+    audit = result.dashboard["decision_audit"]
+    assert audit["original"]["analysis_summary"] == "宜轻仓回踩买入，趋势评分82分。"
+    assert audit["final"]["operation_advice"] == result.operation_advice
+    apply_daily_market_context_guardrail(result, daily_market_context=context)
+    assert result.dashboard["decision_audit"] == audit
+
+
+def test_guardrail_final_summary_is_localized() -> None:
+    for language, expected in [("en", "Final advice: Watch"), ("ko", "최종 권고:")]:
+        result = _result()
+        apply_daily_market_context_guardrail(
+            result, daily_market_context={"risk_tags": ["high_risk"]},
+            report_language=language,
+        )
+        assert expected in result.analysis_summary
+        assert result.dashboard["analysis_summary"] == result.analysis_summary
+
+
 def _result() -> AnalysisResult:
     return AnalysisResult(
         code="600519",

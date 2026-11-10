@@ -28,7 +28,7 @@ def _result(
     title: str,
     published_date: str | None,
     *,
-    snippet: str = "snippet",
+    snippet: str = "600519 510300 earnings",
     url: str | None = None,
     source: str = "example.com",
 ) -> SearchResult:
@@ -48,6 +48,33 @@ def _response(results) -> SearchResponse:
         provider="Mock",
         success=True,
     )
+
+
+def test_quote_landing_page_is_not_news_but_same_domain_article_is_retained():
+    items = [
+        _result('601318股票价格和图表 - SSE:601318 — TradingView', '2026-10-12',
+                snippet='中国平安 股票价格 实时行情 财报', url='https://cn.tradingview.com/symbols/SSE-601318/'),
+        _result('中国平安发布业绩公告', '2026-10-12', snippet='中国平安601318发布半年报。',
+                url='https://cn.tradingview.com/news/company-earnings-601318/'),
+    ]
+    ranked = SearchService._rank_news_response(_response(items), stock_code='601318',
+                                               stock_name='中国平安', prefer_chinese=True, log_scope='test', max_results=5)
+    admitted = SearchService._filter_ranked_news_for_context(ranked, log_scope='test')
+    assert [item.title for item in admitted.results] == ['中国平安发布业绩公告']
+
+
+def test_announcement_about_another_issuer_is_not_direct_company_news():
+    item = _result('某公司(600000)关于向银行申请授信的公告', '2026-10-12',
+                   snippet='公司拟向兴业银行601166申请贷款，审议通过相关公告。')
+    ranked = SearchService._score_news_relevance(item, stock_code='601166', stock_name='兴业银行')
+    assert ranked.relevance_category != SearchService._DIRECT_NEWS_CATEGORY
+
+
+def test_etf_holdings_news_is_background_for_underlying_stock():
+    item = _result('证券保险ETF份额减少2100万份，重仓股中国平安、中信证券', '2026-10-12',
+                   snippet='中国平安601318为第一大重仓股，不是中国平安公司的经营公告。')
+    ranked = SearchService._score_news_relevance(item, stock_code='601318', stock_name='中国平安')
+    assert ranked.relevance_category == SearchService._SECTOR_NEWS_CATEGORY
 
 
 class SearchNewsFreshnessTestCase(unittest.TestCase):
@@ -324,7 +351,7 @@ class SearchNewsFreshnessTestCase(unittest.TestCase):
         resp = service.search_stock_news("600519", "贵州茅台", max_results=1)
         self.assertEqual([r.title for r in resp.results], ["中文快讯"])
         p1.search.assert_called_once()
-        p2.search.assert_called_once()
+        p2.search.assert_not_called()  # Relevant Chinese hit already meets coverage.
 
     def test_search_stock_news_prefers_chinese_direct_hit_before_score_truncation(self) -> None:
         """Chinese direct hits should outrank higher-scored English direct hits before limiting."""
@@ -639,7 +666,7 @@ class SearchNewsFreshnessTestCase(unittest.TestCase):
                     _result(
                         "外围市场走弱拖累科技股",
                         fresh,
-                        snippet="外围市场情绪走弱，带动科技股阶段性回撤。",
+                        snippet="外围市场情绪走弱，带动腾讯控股 00700 科技股阶段性回撤。",
                         source="finance.example.invalid",
                     ),
                 ]
@@ -1864,7 +1891,7 @@ class SearchNewsFreshnessTestCase(unittest.TestCase):
         fresh_iso = fresh_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
         for stock_code, stock_name, expected_lang, expected_country, title, description in (
-            ("600519", "贵州茅台", "zh-hans", "CN", "中文资讯", "中文摘要"),
+            ("600519", "贵州茅台", "zh-hans", "CN", "中文资讯", "贵州茅台 600519 中文摘要"),
             ("AAPL", "Apple", "en", "US", "Apple earnings beat", "English summary"),
         ):
             with self.subTest(stock_code=stock_code):

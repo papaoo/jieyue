@@ -118,7 +118,7 @@ def _normalize_sector_ranking_items(value: Any) -> List[Dict[str, Any]]:
         if not name_text:
             continue
         ranking_item: Dict[str, Any] = {"name": name_text}
-        for optional_field in ("code", "source", "updated_at"):
+        for optional_field in ("code", "source", "updated_at", "as_of", "definition"):
             if item.get(optional_field) is not None:
                 optional_text = str(item.get(optional_field)).strip()
                 if optional_text:
@@ -129,6 +129,10 @@ def _normalize_sector_ranking_items(value: Any) -> List[Dict[str, Any]]:
         rank = _safe_int(item.get("rank"))
         if rank is not None:
             ranking_item["rank"] = rank
+        for field in ('coverage_ratio', 'covered_count', 'population_count'):
+            value = _safe_float(item.get(field))
+            if value is not None and math.isfinite(value):
+                ranking_item[field] = value
         normalized.append(ranking_item)
     return normalized
 
@@ -145,6 +149,11 @@ def _normalize_sector_rankings(value: Any) -> Optional[Dict[str, Any]]:
     }
     if status_text:
         normalized["status"] = status_text
+    for field in ('as_of', 'source', 'definition', 'definition_warning', 'membership_basis',
+                  'membership_is_point_in_time', 'population_basis', 'traded_count', 'mapped_count',
+                  'coverage_complete', 'unmapped_codes', 'related_industry'):
+        if field in value:
+            normalized[field] = value[field]
     return normalized
 
 
@@ -163,7 +172,8 @@ def _extract_ranking_payload_from_block(value: Any) -> Optional[Dict[str, Any]]:
         return None
     data = value.get("data")
     if isinstance(data, dict):
-        payload = dict(data)
+        nested = data.get('sector_rankings')
+        payload = dict(nested if isinstance(nested, dict) else data)
         if isinstance(status, str):
             payload["status"] = status.strip().lower()
         return payload

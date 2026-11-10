@@ -947,15 +947,35 @@ def _mark_chip_structure_unavailable(result: "AnalysisResult", language: str) ->
     data_perspective["chip_unavailable_reason"] = get_chip_unavailable_text(language)
 
 
-def normalize_chip_structure_availability(result: "AnalysisResult", chip_data: Any) -> None:
+def normalize_chip_structure_availability(result: "AnalysisResult", chip_data: Any, evidence: Any = None) -> None:
     """Fill valid chip metrics or collapse placeholder-only chip fields to one fallback line."""
     if not result:
         return
     language = getattr(result, "report_language", "zh")
     if _has_meaningful_chip_data(chip_data):
         fill_chip_structure_if_needed(result, chip_data)
-        return
-    _mark_chip_structure_unavailable(result, language)
+    else:
+        _mark_chip_structure_unavailable(result, language)
+    if isinstance(evidence, dict):
+        if not isinstance(result.dashboard, dict):
+            result.dashboard = {}
+        dp = result.dashboard.get("data_perspective")
+        if not isinstance(dp, dict):
+            dp = {}
+            result.dashboard["data_perspective"] = dp
+        dp['chip_evidence'] = evidence
+        if not _has_meaningful_chip_data(chip_data):
+            labels = {"no_permission": "权限不足", "timeout": "请求超时", "provider_error": "数据源异常",
+                      "disabled": "功能已关闭", "unsupported": "标的不支持", "circuit_open": "数据源冷却中",
+                      "empty_or_incomplete": "数据为空或不完整", "invalid_data": "数据未通过校验",
+                      "unavailable": "暂不可用"}
+            attempts = evidence.get('attempts') or []
+            if language == 'zh':
+                detail = '；'.join(f"{row['source']}：{labels.get(row['status'], row['status'])}" for row in attempts)
+                dp['chip_unavailable_reason'] = f"筹码{labels.get(evidence.get('status'), '暂不可用')}。{detail}；未据此生成筹码结论。"
+            else:
+                dp['chip_unavailable_reason'] = f"Chip data {evidence.get('status')}; " + '; '.join(
+                    f"{row['source']}: {row['status']}" for row in attempts)
 
 
 def fill_chip_structure_if_needed(result: "AnalysisResult", chip_data: Any) -> None:
@@ -969,6 +989,16 @@ def fill_chip_structure_if_needed(result: "AnalysisResult", chip_data: Any) -> N
         # Use `or {}` rather than setdefault so that an explicit `null` from LLM is also replaced
         dp = dash.get("data_perspective") or {}
         dash["data_perspective"] = dp
+        dp.pop('chip_unavailable_reason', None)
+        raw = chip_data.to_dict() if hasattr(chip_data, 'to_dict') else chip_data
+        source = raw.get('source') or 'unknown'
+        as_of = raw.get('date') or 'unknown'
+        dp['chip_source_note'] = (
+            f"source={source}; as_of={as_of}. Estimated cost distribution, not actual holdings or future win probability. "
+            "Older/undated observations are background only."
+            if getattr(result, 'report_language', 'zh') != 'zh' else
+            f"来源：{source}；数据日期：{as_of}。估算成本分布，非真实持仓或未来胜率；历史/未知日期数据仅作背景。"
+        )
         cs = dp.get("chip_structure") or {}
         filled = _build_chip_structure_from_data(
             chip_data,
@@ -3084,6 +3114,9 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
         router_model_names: set[str],
     ) -> Any:
         """Dispatch a LiteLLM completion through router or direct fallback."""
+        from src.llm.free_models import enabled as free_enabled, completion as free_completion
+        if free_enabled(config):
+            return free_completion(config, **call_kwargs)
         origins = route_deployment_origins(config.llm_model_list, model)
         if origins.is_mixed:
             raise RuntimeError("Hermes/non-Hermes mixed generation route is not supported without deployment-level no-proxy client support")
@@ -3633,6 +3666,7 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
             name and usage is a dict with prompt_tokens, completion_tokens, total_tokens.
         """
         config = self._get_runtime_config()
+        from src.llm.free_models import enabled as free_enabled
         max_tokens = (
             generation_config.get('max_output_tokens')
             or generation_config.get('max_tokens')
@@ -3767,6 +3801,8 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
                             progress_callback=stream_progress_callback,
                         )
                     except _LiteLLMStreamError as exc:
+                        if free_enabled(config):
+                            raise  # Never repeat an ambiguous free-channel request.
                         safe_error = self._sanitize_litellm_exception_text(exc, config=config, model=model)
                         if exc.partial_received:
                             logger.warning(
@@ -3782,6 +3818,8 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
                             )
                         last_error = RuntimeError(f"{type(exc).__name__}: {safe_error}")
                     except Exception as exc:
+                        if free_enabled(config):
+                            raise
                         safe_error = self._sanitize_litellm_exception_text(exc, config=config, model=model)
                         logger.warning(
                             "[LiteLLM] %s stream request failed before first chunk, falling back to non-stream: %s",
@@ -4521,6 +4559,7 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
             ttm_yield = dividend_metrics.get("ttm_dividend_yield_pct", "N/A")
             ttm_cash = dividend_metrics.get("ttm_cash_dividend_per_share", "N/A")
             ttm_count = dividend_metrics.get("ttm_event_count", "N/A")
+            dividend_basis = dividend_metrics.get('definition') or ('Source-defined yield; calculation basis unavailable' if english else '来源口径；计算基准未提供')
             report_date = financial_report.get("report_date", "N/A")
             if english:
                 prompt += f"""
@@ -4533,7 +4572,7 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
 | Operating Cash Flow | {financial_report.get('operating_cash_flow', 'N/A')} | |
 | ROE | {financial_report.get('roe', 'N/A')} | |
 | TTM Cash Dividend per Share | {ttm_cash} | Cash dividends only, pre-tax |
-| TTM Dividend Yield | {ttm_yield} | Formula: TTM cash dividend per share / current price × 100% |
+| TTM Dividend Yield | {ttm_yield} | {dividend_basis} |
 | TTM Dividend Events | {ttm_count} | |
 
 > If any field above is N/A or missing, state clearly "data unavailable, cannot judge"; never fabricate.
@@ -4549,11 +4588,36 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
 | 经营现金流 | {financial_report.get('operating_cash_flow', 'N/A')} | |
 | ROE | {financial_report.get('roe', 'N/A')} | |
 | 近12个月每股现金分红 | {ttm_cash} | 仅现金分红、税前口径 |
-| TTM 股息率 | {ttm_yield} | 公式：近12个月每股现金分红 / 当前价格 × 100% |
+| TTM 股息率 | {ttm_yield} | {dividend_basis} |
 | TTM 分红事件数 | {ttm_count} | |
 
 > 若上述字段为 N/A 或缺失，请明确写“数据缺失，无法判断”，禁止编造。
 """
+
+            basis = {key: dividend_metrics.get(key) for key in ('source', 'as_of', 'price_basis', 'cash_unit',
+                     'as_of_events', 'window_start_exclusive', 'window_end', 'definition_events', 'events_complete')
+                     if key in dividend_metrics}
+            if basis:
+                prompt += '\nDividend source/date/window (do not combine different bases): ' + json.dumps(basis, ensure_ascii=english) + '\n'
+
+        # Preserve scoped observations for the standard analyzer, not just the
+        # screening ranker. Missing global institution coverage stays explicit.
+        scoped = {}
+        if isinstance(fundamental_context, dict):
+            for block_name, keys in {
+                'institution': ('report_date', 'previous_report_date', 'announcement_date', 'coverage',
+                                'comparable_institution_change', 'full_institution_coverage'),
+                'dragon_tiger': ('is_on_list', 'recent_count', 'lookback_sessions', 'checked_sessions',
+                                 'missing_sessions', 'coverage_complete', 'definition'),
+            }.items():
+                block = fundamental_context.get(block_name) or {}
+                data = block.get('data') or {}
+                if data:
+                    scoped[block_name] = {'status': block.get('status'),
+                        'missing_fields': block.get('missing_fields', []),
+                        'data': {key: data.get(key) for key in keys if key in data}}
+        if scoped:
+            prompt += '\nScoped disclosed facts (not real-time trading flows): ' + json.dumps(scoped, ensure_ascii=english) + '\n'
 
         capital_flow_block = (
             fundamental_context.get("capital_flow", {})
@@ -4583,6 +4647,14 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
             and (sector_flow.get("top") or sector_flow.get("bottom"))
         )
         if has_capital_flow:
+            flow_basis = {
+                'stock': {key: stock_flow.get(key) for key in ('as_of', 'unit', 'definition')},
+                'sectors': {key: sector_flow.get(key) for key in ('as_of', 'definition', 'definition_warning',
+                           'coverage_complete', 'membership_basis', 'membership_is_point_in_time',
+                           'traded_count', 'mapped_count', 'related_industry')},
+                'status': capital_flow_block.get('status'),
+            }
+            prompt += '\nCapital-flow source/date/scope (not intraday unless stated): ' + json.dumps(flow_basis, ensure_ascii=english) + '\n'
             top_sectors = sector_flow.get("top", []) if isinstance(sector_flow, dict) else []
             bottom_sectors = sector_flow.get("bottom", []) if isinstance(sector_flow, dict) else []
             sector_separator = ", " if english else "、"
@@ -4677,6 +4749,7 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
             profit_ratio = chip.get('profit_ratio', 0)
             prompt += f"""
 ### Chip Distribution (efficiency indicators)
+Source: {chip.get('source', 'unknown')}; business date: {chip.get('date', 'unknown')}. Estimated distribution, not actual positions or future win probability; older/undated data is background only.
 | Indicator | Value | Healthy Range |
 |------|------|----------|
 | **Profit Ratio** | **{profit_ratio:.1%}** | Be cautious at 70-90% |
@@ -4690,6 +4763,7 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
             profit_ratio = chip.get('profit_ratio', 0)
             prompt += f"""
 ### 筹码分布数据（效率指标）
+来源：{chip.get('source', 'unknown')}；数据日期：{chip.get('date', 'unknown')}。估算分布，非真实账户持仓或未来胜率；历史/未知日期数据仅作背景。
 | 指标 | 数值 | 健康标准 |
 |------|------|----------|
 | **获利比例** | **{profit_ratio:.1%}** | 70-90%时警惕 |
@@ -4838,6 +4912,14 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
         # 添加昨日对比数据
         if 'yesterday' in context:
             volume_change = context.get('volume_change_ratio', 'N/A')
+            if context.get('volume_comparison_basis') == 'intraday_vs_previous_full_session':
+                prompt += (
+                    '\nVolume comparison is cumulative intraday versus previous full session, NOT a same-time baseline. '
+                    'Do not infer shrinking volume, flat volume or full-session confirmation from this ratio. '
+                    'Use latest/so far, not closed.\n' if english else
+                    '\n量能口径：盘中累计量/上一完整交易日量，并非同时间对比。不能据此判断缩量、平量或全天放量确认；'
+                    '盘中价格使用“最新价/截至目前”，不得写“收于”。\n'
+                )
             if english:
                 prompt += f"""
 ### Volume and Price Change
@@ -4861,6 +4943,15 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
 """
         
         # 添加新闻搜索结果（重点区域）
+        prompt += (
+            '\nResearch evidence rules: cite the source/date for each material event; separate observed facts, '
+            'possible transmission mechanisms, counterevidence and validation conditions. Sector/macro background '
+            'is not a company event. Scores are not win probabilities. No risk-free or guaranteed-return language.\n'
+            if english else
+            '\n投研证据规则：重要事件注明来源和发布日期，区分“已确认事实→可能影响机制→反证/风险→待验证条件”。'
+            '行业/宏观背景不是公司直接利好；未发现有效新闻不等于不存在风险。规则分不是胜率，'
+            '不得使用“无追高风险、稳赚、安全边际充足”等缺乏论证的绝对判断。\n'
+        )
         news_window_days: Optional[int] = None
         context_window = context.get("news_window_days")
         try:
@@ -5153,13 +5244,17 @@ Output the complete Decision Dashboard in JSON format."""
         realtime = context.get('realtime', {}) or {}
         yesterday = context.get('yesterday', {}) or {}
 
-        prev_close = yesterday.get('close')
+        is_realtime_bar = str(today.get('data_source', '')).startswith('realtime:')
+        prev_close = today.get('pre_close')
+        if prev_close is None:
+            prev_close = yesterday.get('close')
         close = today.get('close')
         high = today.get('high')
         low = today.get('low')
 
         amplitude = None
         change_amount = None
+        pct_chg = today.get('pct_chg')
         if prev_close not in (None, 0) and high is not None and low is not None:
             try:
                 amplitude = (float(high) - float(low)) / float(prev_close) * 100
@@ -5168,6 +5263,8 @@ Output the complete Decision Dashboard in JSON format."""
         if prev_close is not None and close is not None:
             try:
                 change_amount = float(close) - float(prev_close)
+                if float(prev_close) > 0:
+                    pct_chg = change_amount / float(prev_close) * 100
             except (TypeError, ValueError):
                 change_amount = None
 
@@ -5178,14 +5275,19 @@ Output the complete Decision Dashboard in JSON format."""
             "high": self._format_price(high),
             "low": self._format_price(low),
             "prev_close": self._format_price(prev_close),
-            "pct_chg": self._format_percent(today.get('pct_chg')),
+            "pct_chg": self._format_percent(pct_chg),
             "change_amount": self._format_price(change_amount),
             "amplitude": self._format_percent(amplitude),
             "volume": self._format_volume(today.get('volume')),
             "amount": self._format_amount(today.get('amount')),
+            "source": today.get('data_source') or today.get('dataSource') or 'unknown',
+            "volume_unit": "shares",
+            "is_partial_bar": today.get('is_partial_bar'),
+            "provider_timestamp": today.get('provider_timestamp'),
+            "date_basis": today.get('date_basis', 'daily_bar'),
         }
 
-        if realtime:
+        if realtime and is_realtime_bar:
             snapshot.update({
                 "price": self._format_price(realtime.get('price')),
                 "volume_ratio": realtime.get('volume_ratio', 'N/A'),
@@ -5590,46 +5692,37 @@ Output the complete Decision Dashboard in JSON format."""
         self._validate_analysis_minimal_contract(data)
     
     def _parse_text_response(
-        self, 
-        response_text: str, 
-        code: str, 
+        self,
+        response_text: str,
+        code: str,
         name: str
     ) -> AnalysisResult:
-        """从纯文本响应中尽可能提取分析信息"""
+        """从无法解析为 JSON 的响应中构造**明确的失败态**结果。
+
+        历史行为是用「看多/买入/上涨…」等关键词计数来伪造 sentiment_score 与
+        decision_type（buy=65 / sell=35）。这有两个问题：
+
+        1. 词频无法处理否定语境——「不建议买入」「买入信号消失」同样会被判为看多；
+        2. 伪造出的评分/建议与模型真实判断共享同一字段结构，下游（报告、决策信号、
+           回测方向命中统计）无法区分「模型判断」与「词频统计」，失败事实被淹没在
+           小字提示里。
+
+        现在统一回到 canonical 决策刻度的中性档（40-59 = 观望 / watch / hold），
+        由 success=False + error_message 明确标记「本次没有得到可用结论」。
+        """
         report_language = normalize_report_language(
             getattr(self._get_runtime_config(), "report_language", "zh")
         )
-        # 尝试识别关键词来判断情绪
+        # canonical 中性档：无方向性结论，不猜、不伪造
         sentiment_score = 50
         trend = localize_trend_prediction('震荡', report_language)
-        advice = localize_operation_advice('持有', report_language)
-        
-        text_lower = response_text.lower()
-        
-        # 简单的情绪识别
-        positive_keywords = ['看多', '买入', '上涨', '突破', '强势', '利好', '加仓', 'bullish', 'buy']
-        negative_keywords = ['看空', '卖出', '下跌', '跌破', '弱势', '利空', '减仓', 'bearish', 'sell']
-        
-        positive_count = sum(1 for kw in positive_keywords if kw in text_lower)
-        negative_count = sum(1 for kw in negative_keywords if kw in text_lower)
-        
-        if positive_count > negative_count + 1:
-            sentiment_score = 65
-            trend = localize_trend_prediction('看多', report_language)
-            advice = localize_operation_advice('买入', report_language)
-            decision_type = 'buy'
-        elif negative_count > positive_count + 1:
-            sentiment_score = 35
-            trend = localize_trend_prediction('看空', report_language)
-            advice = localize_operation_advice('卖出', report_language)
-            decision_type = 'sell'
-        else:
-            decision_type = 'hold'
-        
+        advice = localize_operation_advice('观望', report_language)
+        decision_type = 'hold'
+
         # 截取前500字符作为摘要
         summary = response_text[:500] if response_text else _localized_text(
             report_language, en='No analysis result', zh='无分析结果', ko='분석 결과 없음')
-        
+
         result = AnalysisResult(
             code=code,
             name=name,
@@ -5641,19 +5734,22 @@ Output the complete Decision Dashboard in JSON format."""
             analysis_summary=summary,
             key_points=_localized_text(
                 report_language,
-                en='JSON parsing failed; treat this as best-effort output.',
-                zh='JSON解析失败，仅供参考',
-                ko='JSON 파싱에 실패했습니다. 참고용으로만 사용하세요.',
+                en='LLM output could not be parsed; no rating was derived (neutral placeholder).',
+                zh='模型输出解析失败，未生成评级（当前为中性占位，不代表真实观点）',
+                ko='모델 출력을 파싱하지 못해 등급을 생성하지 않았습니다(중립 자리표시자).',
             ),
             risk_warning=_localized_text(
                 report_language,
-                en='The result may be inaccurate. Cross-check with other information.',
-                zh='分析结果可能不准确，建议结合其他信息判断',
-                ko='결과가 부정확할 수 있습니다. 다른 정보와 교차 확인하세요.',
+                en='This analysis failed and carries no actionable signal. Do not trade on it.',
+                zh='本次分析失败，不构成任何可执行信号，请勿据此交易',
+                ko='이번 분석은 실패했으며 실행 가능한 시그널이 아닙니다. 근거로 거래하지 마세요.',
             ),
             raw_response=response_text,
             success=False,
-            error_message='LLM response is not valid JSON; analysis result will not be persisted',
+            error_message=(
+                'LLM response is not valid JSON; no rating derived '
+                '(neutral placeholder, result will not be persisted)'
+            ),
             report_language=report_language,
         )
         return populate_decision_action_fields(result, align_with_score=False)

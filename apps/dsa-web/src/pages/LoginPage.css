@@ -1,0 +1,213 @@
+.jieyue-login {
+  --jy-bg: #0b0f13;
+  --jy-panel: #131a20;
+  --jy-text: #eef4fb;
+  --jy-secondary: #a4b1c4;
+  --jy-muted: #7e90a7;
+  --jy-accent: #ced9bd;
+  --jy-line: #c3dbff1c;
+  --jy-cta: #e4eadb;
+  --jy-cta-text: #0d1c2d;
+  --jy-glow: #748e751c;
+  --jy-ease: cubic-bezier(.22, 1, .36, 1);
+  --login-label-text: var(--jy-secondary);
+  --login-input-icon: var(--jy-muted);
+  --login-input-surface: #080f19;
+  --login-input-border: #8cabd02e;
+  --login-input-border-hover: #8cabd080;
+  --login-input-border-focus: var(--jy-accent);
+  --login-input-focus-ring: 0 0 0 3px #ced9bd16;
+  --login-input-text: var(--jy-text);
+  --login-input-placeholder: var(--jy-secondary);
+  --login-input-caret: var(--jy-accent);
+  /* This paints characters (including password bullets), not the surface. */
+  --login-input-fill: var(--login-input-text);
+  --login-input-shadow: inset 0 1px 3px #00000018;
+  --login-input-toggle-bg: transparent;
+  --login-input-toggle-border: transparent;
+  --login-input-toggle-text: var(--jy-muted);
+  --login-input-toggle-active-text: var(--jy-text);
+  --login-input-toggle-active-bg: #83c7ff12;
+  --login-input-toggle-active-border: #83c7ff35;
+  --login-input-toggle-bg-hover: #83c7ff12;
+  --login-input-toggle-border-hover: #83c7ff35;
+  --login-input-toggle-text-hover: var(--jy-text);
+  --login-input-toggle-ring: #83c7ff50;
+  --login-accent-glow: #83c7ff18;
+  position: relative;
+  isolation: isolate;
+  display: flex;
+  min-height: 100dvh;
+  flex-direction: column;
+  padding: 1.8rem clamp(1.25rem, 4vw, 4rem);
+  background: var(--jy-bg);
+  color: var(--jy-text);
+  font-family: 'Segoe UI Variable', 'Segoe UI', 'Microsoft YaHei UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif;
+}
+.light .jieyue-login {
+  --jy-bg: #eff3f8;
+  --jy-panel: #f8fafd;
+  --jy-text: #162436;
+  --jy-secondary: #4f617a;
+  --jy-muted: #63758c;
+  --jy-accent: #2867a8;
+  --jy-line: #244a6d26;
+  --jy-cta: #162f4d;
+  --jy-cta-text: #f0f6ff;
+  --jy-glow: #6ba7e82a;
+  --login-input-surface: #eef3f9;
+  --login-input-border: #53779b55;
+  --login-input-border-hover: #53779b99;
+  --login-input-focus-ring: 0 0 0 3px #2867a81c;
+}
+.jieyue-login__atmosphere { position: absolute; inset: 0; z-index: -1; overflow: hidden; pointer-events: none; background: radial-gradient(ellipse at 23% 38%, var(--jy-glow), transparent 52%), radial-gradient(ellipse at 83% 73%, #3b6fab10, transparent 46%); }
+.jieyue-login__atmosphere::after { content: ''; position: absolute; inset: 0; opacity: .18; background-image: linear-gradient(var(--jy-line) 1px, transparent 1px), linear-gradient(90deg, var(--jy-line) 1px, transparent 1px); background-size: 88px 88px; mask-image: radial-gradient(ellipse at 30% 42%, #000, transparent 70%); }
+.jieyue-login__header, .jieyue-login__footer { display: flex; justify-content: space-between; align-items: center; gap: 1rem; width: 100%; max-width: 88rem; margin-inline: auto; }
+.jieyue-login__wordmark { display: flex; align-items: center; gap: .7rem; font-size: 1.06rem; font-weight: 650; letter-spacing: .14em; }
+.jieyue-login__wordmark > span { display: grid; gap: .1rem; }
+.jieyue-login__wordmark small { font-size: .55rem; letter-spacing: .22em; color: var(--jy-muted); font-weight: 500; }
+.jieyue-login__small-mark { width: 2.2rem; height: 2.2rem; color: var(--jy-accent); }
+.jieyue-login__controls { display: flex; align-items: center; gap: .35rem; padding: .25rem; border-radius: 999px; background: #7daeff09; box-shadow: inset 0 1px 0 var(--jy-line); }
+.jieyue-login__control { display: inline-flex; min-height: 2.5rem; align-items: center; justify-content: center; gap: .5rem; padding: .5rem .8rem; border: 0; border-radius: 999px; background: transparent; color: var(--jy-secondary); font-size: .75rem; cursor: pointer; transition: color .25s var(--jy-ease), background-color .25s var(--jy-ease), transform .25s var(--jy-ease); }
+.jieyue-login__control:hover { color: var(--jy-text); background: var(--jy-line); }
+.jieyue-login__control:active { transform: scale(.96); }
+.jieyue-login button:focus-visible { outline: 2px solid var(--jy-accent); outline-offset: 4px; }
+.jieyue-login input:focus-visible { outline: 2px solid transparent; }
+.jieyue-login__workspace { display: grid; flex: 1; grid-template-columns: minmax(0, 1.42fr) minmax(21rem, .9fr); align-items: center; gap: clamp(2.5rem, 6vw, 6rem); width: 100%; max-width: 77rem; margin: 2.5rem auto; }
+.jieyue-login__identity { min-width: 0; }
+.jieyue-login__identity-copy { position: relative; padding-left: .3rem; }
+.jieyue-login__title-row { display: flex; align-items: flex-end; gap: 2rem; }
+.jieyue-login__title-row h1 { font-size: clamp(3.5rem, 5.5vw, 5rem); font-weight: 600; letter-spacing: .06em; line-height: 1.15; margin: 0; text-shadow: 0 2px 28px #93c3ff12; }
+.jieyue-login__english-name { display: flex; gap: .7rem; align-items: center; margin-bottom: .65rem; font-size: .82rem; letter-spacing: .24em; color: var(--jy-muted); }
+.jieyue-login__english-name > span { font-size: 1.7rem; font-weight: 300; color: var(--jy-accent); }
+.jieyue-login__tagline { margin-top: 1.05rem; font-size: clamp(1rem, 1.6vw, 1.3rem); font-weight: 400; letter-spacing: .1em; color: var(--jy-secondary); text-wrap: balance; }
+
+/* Original financial motion study. All data is synthetic, not a quote feed. */
+.stock-scene { position: relative; width: 100%; height: clamp(21rem, 28vw, 25rem); margin: -1.5rem 0 2rem; perspective: 1000px; }
+.stock-scene__bloom { position: absolute; inset: 12% -8% -5%; pointer-events: none; background: radial-gradient(ellipse at 35% 36%, #87b39a20, transparent 62%), radial-gradient(ellipse at 75% 65%, #b49c8620, transparent 50%); }
+.stock-scene__art { position: absolute; inset: 2% -8% 0; width: 116%; height: 92%; overflow: visible; transform: rotateX(12deg) rotateY(-10deg) rotateZ(-4deg); transform-origin: 45% 50%; }
+.stock-scene__grid { stroke: var(--jy-line); stroke-width: .7; }
+.stock-scene__price-trace { stroke: #e5e9d3; stroke-opacity: .65; stroke-width: 1.5; }
+.stock-scene__secondary-trace { stroke: #b7c9c7; stroke-opacity: .24; stroke-width: .8; stroke-dasharray: 3 5; }
+.stock-scene__secondary-trace--faint { stroke-opacity: .1; }
+.stock-scene__baseline { stroke: var(--jy-line); }
+.stock-scene__caption { position: absolute; inset: auto 0 0; display: flex; align-items: center; gap: .5rem; color: var(--jy-muted); font-size: .61rem; letter-spacing: .08em; }
+.stock-scene__caption > span { width: 1rem; height: 1px; background: var(--jy-accent); opacity: .55; }
+.stock-scene__depth { fill: #8ed4ba; opacity: .08; }
+.stock-scene__volume { transform-box: fill-box; transform-origin: center bottom; }
+.stock-scene__signal { color: #e4e8d4; opacity: 0; }
+.stock-scene__scan, .stock-scene__focus { opacity: 0; }
+.stock-scene[data-ambient='on'] .stock-scene__market-track { animation: stock-market-flow 18s linear infinite; will-change: transform; }
+.stock-scene[data-ambient='on'] .stock-scene__scan { opacity: 1; animation: stock-market-scan 7s linear infinite; }
+.stock-scene[data-ambient='on'] .stock-scene__focus { animation: stock-focus 7s ease-in-out infinite; }
+.stock-scene[data-ambient='on'] .stock-scene__pulse { animation: stock-pulse 2.5s ease-out infinite; transform-origin: center; transform-box: fill-box; }
+.stock-scene[data-ambient='on'] .stock-scene__art { animation: stock-camera 12s ease-in-out infinite; }
+.stock-scene[data-ambient='on'] .stock-scene__volume { animation: stock-volume 4.8s cubic-bezier(.45, 0, .55, 1) infinite; }
+.stock-scene[data-ambient='on'] .stock-scene__depth { animation: stock-depth 6s cubic-bezier(.45, 0, .55, 1) infinite; }
+.stock-scene[data-ambient='on'] .stock-scene__signal { animation: stock-signal 10s linear infinite; opacity: .9; }
+@keyframes stock-volume { 0%, 100% { transform: scaleY(.76); opacity: .6; } 50% { transform: scaleY(1.08); opacity: 1; } }
+@keyframes stock-depth { 0%, 100% { transform: translateX(0); opacity: .06; } 50% { transform: translateX(-12px); opacity: .16; } }
+@keyframes stock-market-flow { to { transform: translateX(-800px); } }
+@keyframes stock-market-scan { 0% { transform: translateX(0); opacity: 0; } 8% { opacity: 1; } 92% { opacity: 1; } 100% { transform: translateX(800px); opacity: 0; } }
+@keyframes stock-focus { 0%, 100% { transform: translate(180px, 125px); opacity: 0; } 20% { opacity: .9; } 50% { transform: translate(530px, 175px); opacity: .9; } 80% { opacity: .9; } }
+@keyframes stock-pulse { from { transform: scale(.3); opacity: .8; } to { transform: scale(2.1); opacity: 0; } }
+@keyframes stock-camera { 0%, 100% { transform: rotateX(12deg) rotateY(-10deg) rotateZ(-4deg) translateY(0); } 50% { transform: rotateX(8deg) rotateY(-5deg) rotateZ(-2deg) translateY(-9px); } }
+/* Sampled from the same synthetic price trace; no live signal is implied. */
+@keyframes stock-signal {
+  0% { transform: translate(0px, 166.78px); }
+  3.125% { transform: translate(25px, 148.30px); }
+  6.25% { transform: translate(50px, 138.24px); }
+  9.375% { transform: translate(75px, 136.51px); }
+  12.5% { transform: translate(100px, 140.51px); }
+  15.625% { transform: translate(125px, 146.07px); }
+  18.75% { transform: translate(150px, 149.02px); }
+  21.875% { transform: translate(175px, 146.66px); }
+  25% { transform: translate(200px, 138.72px); }
+  28.125% { transform: translate(225px, 127.53px); }
+  31.25% { transform: translate(250px, 117.21px); }
+  34.375% { transform: translate(275px, 112.30px); }
+  37.5% { transform: translate(300px, 116.16px); }
+  40.625% { transform: translate(325px, 129.80px); }
+  43.75% { transform: translate(350px, 151.41px); }
+  46.875% { transform: translate(375px, 176.93px); }
+  50% { transform: translate(400px, 201.22px); }
+  53.125% { transform: translate(425px, 219.70px); }
+  56.25% { transform: translate(450px, 229.76px); }
+  59.375% { transform: translate(475px, 231.49px); }
+  62.5% { transform: translate(500px, 227.49px); }
+  65.625% { transform: translate(525px, 221.93px); }
+  68.75% { transform: translate(550px, 218.98px); }
+  71.875% { transform: translate(575px, 221.34px); }
+  75% { transform: translate(600px, 229.28px); }
+  78.125% { transform: translate(625px, 240.47px); }
+  81.25% { transform: translate(650px, 250.79px); }
+  84.375% { transform: translate(675px, 255.70px); }
+  87.5% { transform: translate(700px, 251.84px); }
+  90.625% { transform: translate(725px, 238.20px); }
+  93.75% { transform: translate(750px, 216.59px); }
+  96.875% { transform: translate(775px, 191.07px); }
+  100% { transform: translate(800px, 166.78px); }
+}
+.light .stock-scene__price-trace { stroke: #6d7462; }
+.light .stock-scene__secondary-trace { stroke: #587d6c; }
+.light .stock-scene__signal { color: #587d6c; }
+.light .stock-scene__candle { filter: brightness(.86) saturate(.95); }
+@media (max-width: 767px) {
+  .stock-scene { height: 11.8rem; margin: .65rem 0 .7rem; overflow: hidden; }
+  .stock-scene__art { inset-inline: -5%; width: 110%; height: 89%; }
+  .stock-scene__caption { font-size: .56rem; }
+}
+.jieyue-login__panel-shell { position: relative; padding: 7px; border-radius: 1.9rem; background: linear-gradient(145deg, #aacdfb29, #83baff06 45%, #83baff12); box-shadow: inset 0 1px 0 #c6e2ff32, 0 26px 90px #020e2229; }
+.jieyue-login__panel-shell::before { content: ''; position: absolute; width: 28%; height: 1px; top: 0; left: 15%; background: linear-gradient(90deg, transparent, #bfdeffb0, transparent); }
+.jieyue-login__panel { position: relative; padding: clamp(1.7rem, 3vw, 2.65rem); border-radius: 1.45rem; background: radial-gradient(ellipse at 10% 0, #83baff0a, transparent 65%), var(--jy-panel); box-shadow: inset 0 1px 0 var(--jy-line), inset 0 -1px 0 #020e2218; }
+.jieyue-login__access-icon { display: grid; place-items: center; width: 2.8rem; height: 2.8rem; margin-bottom: 1.35rem; border-radius: .85rem; color: var(--jy-accent); background: linear-gradient(145deg, #83c7ff16, #83c7ff04); box-shadow: inset 0 1px 0 #83c7ff38, inset 0 -1px 0 #83c7ff12; }
+.jieyue-login__panel-header h2 { margin: 0; font-size: 1.65rem; font-weight: 550; letter-spacing: -.03em; line-height: 1.5; }
+.jieyue-login__panel-header p { margin-top: .65rem; font-size: .8rem; color: var(--jy-secondary); line-height: 1.85; }
+.jieyue-login__form { display: grid; gap: 1.15rem; margin-top: 2.2rem; }
+.jieyue-login .input-appearance-login { min-height: 3.3rem; border-radius: .8rem; font-size: .84rem; transition-duration: .25s; transition-timing-function: var(--jy-ease); }
+.jieyue-login .input-appearance-login::placeholder { opacity: 1; }
+.jieyue-login__submit { width: 100%; min-height: 3.4rem; justify-content: space-between; margin-top: .5rem; padding: .45rem .45rem .45rem 1.25rem; border: 0; border-radius: 999px; background: linear-gradient(180deg, #ffffff18, transparent), var(--jy-cta); color: var(--jy-cta-text); box-shadow: inset 0 1px 0 #ffffff70, 0 7px 25px #83c7ff08; font-size: .84rem; font-weight: 600; letter-spacing: .03em; transition: transform .35s var(--jy-ease), box-shadow .35s var(--jy-ease); }
+.jieyue-login__submit:hover { transform: translateY(-2px); box-shadow: inset 0 1px 0 #ffffff70, 0 10px 32px #83c7ff20; }
+.jieyue-login__submit:active { transform: scale(.98); }
+.jieyue-login__submit-icon { display: grid; width: 2.5rem; height: 2.5rem; place-items: center; border-radius: 50%; background: #3b648b15; box-shadow: inset 0 1px 2px #223f6810; }
+.jieyue-login__submit-icon svg { transition: transform .4s var(--jy-ease); }
+.jieyue-login__submit:hover .jieyue-login__submit-icon svg { transform: translate(2px, -2px); }
+.jieyue-login__progress-mark { width: .4rem; height: .4rem; border-radius: 50%; background: currentColor; }
+.jieyue-login[data-login-motion='on'] .jieyue-login__progress-mark { animation: jieyue-breathe .8s var(--jy-ease) infinite; }
+.jieyue-login__connection { display: flex; align-items: flex-start; gap: .6rem; margin-top: 1.8rem; padding-top: 1.2rem; border-top: 1px solid var(--jy-line); color: var(--jy-muted); font-size: .68rem; line-height: 1.8; }
+.jieyue-login__connection svg { flex: none; margin-top: .2rem; }
+.jieyue-login__connection p { margin: 0; }
+.jieyue-login__footer { padding-top: 1rem; border-top: 1px solid var(--jy-line); color: var(--jy-muted); font-size: .63rem; line-height: 1.7; }
+.jieyue-login__footer-signature { font-family: ui-monospace, Consolas, monospace; font-size: .57rem; letter-spacing: .12em; }
+.jieyue-login__error { min-width: 0; }
+.light .jieyue-login__panel-shell { background: linear-gradient(145deg, #ffffff, #487bbd12); box-shadow: inset 0 1px 0 #fff, 0 22px 80px #183e6a12; }
+.light .jieyue-login__panel-shell::before { background: linear-gradient(90deg, transparent, #598fc490, transparent); }
+html[data-motion='off'] .jieyue-login *, html[data-motion='off'] .jieyue-login *::after,
+.jieyue-login[data-login-motion='off'] *, .jieyue-login[data-login-motion='off'] *::after { animation: none !important; transition: none !important; }
+@media (prefers-reduced-motion: reduce) { .jieyue-login *, .jieyue-login *::after { animation: none !important; transition: none !important; } }
+@media (max-width: 1023px) and (min-width: 768px) { .jieyue-login__workspace { gap: 2rem; grid-template-columns: minmax(0, 1fr) minmax(19rem, .9fr); } .jieyue-login__title-row { gap: 1rem; } .jieyue-login__english-name { font-size: .65rem; } .stock-scene { height: 20rem; } }
+@media (max-width: 767px) {
+  .jieyue-login { padding: 1rem 1.25rem 1.2rem; }
+  .jieyue-login__controls { gap: 0; }
+  .jieyue-login__control { min-width: 2.65rem; padding-inline: .55rem; }
+  .jieyue-login__control > span { display: none; }
+  .jieyue-login__wordmark { font-size: .94rem; gap: .55rem; }
+  .jieyue-login__small-mark { width: 1.8rem; height: 1.8rem; }
+  .jieyue-login__workspace { display: flex; flex-direction: column; align-items: stretch; gap: 1.7rem; max-width: 30rem; margin: 1.4rem auto 2rem; }
+  .jieyue-login__title-row { gap: 1.3rem; }
+  .jieyue-login__title-row h1 { font-size: 2.9rem; }
+  .jieyue-login__english-name { font-size: .65rem; margin-bottom: .3rem; }
+  .jieyue-login__english-name > span { font-size: 1.25rem; }
+  .jieyue-login__tagline { margin-top: .5rem; font-size: 1rem; }
+  .jieyue-login__panel-shell { padding: 6px; border-radius: 1.55rem; }
+  .jieyue-login__panel { padding: 1.3rem 1.35rem; border-radius: 1.18rem; }
+  .jieyue-login__access-icon { display: none; }
+  .jieyue-login__panel-header h2 { font-size: 1.4rem; }
+  .jieyue-login__panel-header p { font-size: .74rem; margin-top: .3rem; }
+  .jieyue-login__form { margin-top: 1.1rem; gap: 1rem; }
+  .jieyue-login .input-appearance-login { min-height: 3.1rem; }
+  .jieyue-login__submit { min-height: 3.2rem; margin-top: .2rem; }
+  .jieyue-login__connection { margin-top: 1.15rem; padding-top: .85rem; font-size: .61rem; }
+  .jieyue-login__footer { flex-wrap: wrap; font-size: .57rem; gap: .5rem; }
+  .jieyue-login__footer-signature { font-size: .48rem; }
+}

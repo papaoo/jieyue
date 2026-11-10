@@ -3,8 +3,8 @@
 # 低波动质量策略
 name: low_volatility_quality
 display_name: 低波质量
-description: 偏防守的质量型候选，优先选择波动较低、回撤浅、估值不过热且数据质量可靠的股票
-version: "1.0"
+description: 基于低波动、浅回撤与估值的防守观察候选，数据质量不等于财务质量
+version: "2.1"
 category: quality
 tags: [quality, defensive, low_volatility, daily_k]
 style:
@@ -16,6 +16,7 @@ style:
   ui_badge: 质量
 
 screening:
+  evidence_mode: daily_required
   enabled: true
   market_scope: [cn]
   hard_filters:

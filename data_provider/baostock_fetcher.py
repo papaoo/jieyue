@@ -73,6 +73,7 @@ class BaostockFetcher(BaseFetcher):
     """
     
     name = "BaostockFetcher"
+    price_adjustment = "qfq"  # 前复权日线（fqt=1 / adjustflag=2 / auto_adjust 等，详见各自实现）
     priority = int(os.getenv("BAOSTOCK_PRIORITY", "3"))
     
     def __init__(self):

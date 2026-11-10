@@ -21,6 +21,7 @@ class DailyBarLike(Protocol):
     """Protocol for objects representing a daily OHLC bar."""
 
     date: date
+    open: Optional[float]
     high: Optional[float]
     low: Optional[float]
     close: Optional[float]
@@ -44,13 +45,51 @@ class BacktestResultLike(Protocol):
 
 @dataclass(frozen=True)
 class EvaluationConfig:
+    """评估参数。
+
+    v2 起修正了 v1 的两个系统性偏差：
+    1. **前视偏差**：v1 用信号当日收盘价入场（信号本身产生于当日收盘），
+       等于用收盘后的信息按收盘价成交。v2 默认 ``execution_lag_days=1``，
+       即信号次日执行（优先次日开盘价，无 open 时退化为次日收盘价）。
+    2. **零成本**：v1 的模拟收益是裸价差，没有手续费、印花税和滑点，
+       系统性高估策略表现。v2 默认按 A 股口径计入双边成本。
+    """
+
     eval_window_days: int
     neutral_band_pct: float = 2.0
-    engine_version: str = "v1"
+    engine_version: str = "v2"
+    # 执行语义
+    execution_lag_days: int = 1
+    # 成本模型（单边，bps = 万分之一）
+    commission_bps: float = 3.0   # 佣金
+    stamp_duty_bps: float = 5.0   # 印花税（仅卖出收取，A 股单向）
+    slippage_bps: float = 5.0     # 滑点
+
+    @property
+    def entry_cost_rate(self) -> float:
+        """买入单边费率（佣金 + 滑点）。"""
+        return max(0.0, (float(self.commission_bps) + float(self.slippage_bps)) / 10000.0)
+
+    @property
+    def exit_cost_rate(self) -> float:
+        """卖出单边费率（佣金 + 印花税 + 滑点）。"""
+        return max(
+            0.0,
+            (float(self.commission_bps) + float(self.stamp_duty_bps) + float(self.slippage_bps)) / 10000.0,
+        )
 
 
 class BacktestEngine:
-    """Long-only daily-bar backtesting engine."""
+    """LLM 研判建议评估引擎（单标的、日线、long/cash 两态）。
+
+    .. warning::
+       **它不是组合回测引擎。** 本引擎评估的是「历史研判建议的事后表现」：
+       输入一份 LLM ``operation_advice``（或结构化 action），输出该建议在
+       后续 N 个交易日的方向命中与模拟收益。它没有组合资金、仓位分配、
+       多标的权重和撮合队列，不能直接当作策略净值曲线使用。
+       真实组合回测请使用 :mod:`src.core.etf_rotation`（次日执行 + 成本 +
+       停牌桥接 + 净值/夏普/最大回撤）。
+    """
 
     # Operation advice keywords (Chinese + English)
     _BULLISH_KEYWORDS = (
@@ -155,6 +194,55 @@ class BacktestEngine:
         return "cash"
 
     @classmethod
+    def _resolve_entry_price(
+        cls,
+        start_price: float,
+        window_bars: Sequence[DailyBarLike],
+        config: EvaluationConfig,
+    ) -> tuple:
+        """Resolve the executable entry price for a signal produced at T's close.
+
+        The signal is generated *after* T's close, so filling at T's close is a
+        look-ahead bias. With ``execution_lag_days=1`` we enter at the next
+        session's open (the earliest price a follower could actually trade at);
+        when a bar lacks ``open`` we degrade to that bar's close, which is still
+        one session later and therefore free of look-ahead.
+
+        Returns ``(entry_price, basis)``.
+        """
+        lag = max(0, int(getattr(config, "execution_lag_days", 1)))
+        if lag <= 0:
+            # Explicitly opted into same-close execution (research only).
+            return start_price, "signal_close"
+
+        index = lag - 1
+        if index < len(window_bars):
+            bar = window_bars[index]
+            open_price = cls._finite_optional_float(getattr(bar, "open", None))
+            if open_price is not None and open_price > 0:
+                return open_price, "next_open"
+            close_price = cls._finite_optional_float(getattr(bar, "close", None))
+            if close_price is not None and close_price > 0:
+                return close_price, "next_close"
+        return start_price, "signal_close_fallback"
+
+    @classmethod
+    def _net_return_pct(
+        cls,
+        entry_price: float,
+        exit_price: float,
+        config: EvaluationConfig,
+    ) -> Optional[float]:
+        """Return after round-trip costs (buy entry + sell exit)."""
+        if entry_price is None or exit_price is None or entry_price <= 0:
+            return None
+        buy = entry_price * (1.0 + config.entry_cost_rate)
+        sell = exit_price * (1.0 - config.exit_cost_rate)
+        if buy <= 0:
+            return None
+        return round((sell - buy) / buy * 100, 4)
+
+    @classmethod
     def evaluate_single(
         cls,
         *,
@@ -168,7 +256,22 @@ class BacktestEngine:
     ) -> Dict[str, Any]:
         """Evaluate one historical analysis against forward daily bars.
 
-        Notes:
+        Two bases are deliberately kept apart:
+
+        - ``stock_return_pct`` — measured from the **decision point** (the signal
+          bar's close). Direction hit / win-loss classification uses it, because
+          the prediction is made at that point and evaluating a prediction from
+          that point carries no look-ahead.
+        - ``entry_price`` / ``trade_return_pct`` / ``simulated_return_pct`` —
+          measured from the **executable** price (next session by default) and
+          net of round-trip costs. Tradeable P&L must never fill at the signal
+          bar's close, which is the actual look-ahead in the old behavior.
+
+        Notes
+        -----
+        - Long positions pay round-trip costs; cash positions are measured as
+          *relative* performance versus holding from the same entry (no trade
+          happens, so no costs apply).
         - Daily bars cannot determine intraday ordering. If stop-loss and
           take-profit are both touched in the same bar, we record
           first_hit="ambiguous" and assume stop-loss first for simulated exit.
@@ -204,17 +307,29 @@ class BacktestEngine:
         max_high = max(highs) if highs else None
         min_low = min(lows) if lows else None
 
-        stock_return_pct: Optional[float]
+        entry_price, entry_basis = cls._resolve_entry_price(start_price, window_bars, config)
+
+        # 决策点度量（预测质量）：以信号当日收盘价为基准。
+        # 交易损益（可成交）：以次日开盘价为基准并计入成本。
+        # 两者必须分开——前视偏差只存在于"按信号当日收盘价成交"这个动作里，
+        # 而预测本身是从决策点开始计量的。
+        decision_return_pct: Optional[float]
         if end_close is None:
-            stock_return_pct = None
+            decision_return_pct = None
         else:
-            stock_return_pct = (end_close - start_price) / start_price * 100
+            decision_return_pct = (end_close - start_price) / start_price * 100
+
+        trade_return_pct: Optional[float]
+        if end_close is None:
+            trade_return_pct = None
+        else:
+            trade_return_pct = (end_close - entry_price) / entry_price * 100
 
         direction_expected = cls.infer_direction_expected(operation_advice)
         position = cls.infer_position_recommendation(operation_advice)
 
         outcome, direction_correct = cls._classify_outcome(
-            stock_return_pct=stock_return_pct,
+            stock_return_pct=decision_return_pct,
             direction_expected=direction_expected,
             neutral_band_pct=config.neutral_band_pct,
         )
@@ -235,14 +350,23 @@ class BacktestEngine:
             end_close=end_close,
         )
 
-        simulated_entry_price = start_price if position == "long" else None
-        simulated_return_pct: Optional[float]
         if position != "long":
-            simulated_return_pct = 0.0
-        elif simulated_exit_price is None:
-            simulated_return_pct = None
+            # 空仓建议相对「同日开盘买入并持有」的收益：不发生交易，因此不计成本。
+            # 正值 = 避跌有效；负值 = 踏空代价（v1 恒为 0，等于放弃评估卖出建议）。
+            cash_relative_return_pct = (
+                round(-trade_return_pct, 4) if trade_return_pct is not None else None
+            )
+            simulated_entry_price = None
+            simulated_return_pct = cash_relative_return_pct
+            simulated_return_basis = "cash_vs_hold"
         else:
-            simulated_return_pct = (simulated_exit_price - start_price) / start_price * 100
+            simulated_entry_price = entry_price
+            simulated_return_pct = (
+                cls._net_return_pct(entry_price, simulated_exit_price, config)
+                if simulated_exit_price is not None
+                else None
+            )
+            simulated_return_basis = "long_net_of_costs"
 
         return {
             "analysis_date": analysis_date,
@@ -252,10 +376,13 @@ class BacktestEngine:
             "operation_advice": operation_advice,
             "position_recommendation": position,
             "start_price": start_price,
+            "entry_price": entry_price,
+            "entry_price_basis": entry_basis,
             "end_close": end_close,
             "max_high": max_high,
             "min_low": min_low,
-            "stock_return_pct": stock_return_pct,
+            "stock_return_pct": decision_return_pct,
+            "trade_return_pct": trade_return_pct,
             "direction_expected": direction_expected,
             "direction_correct": direction_correct,
             "outcome": outcome,
@@ -270,6 +397,10 @@ class BacktestEngine:
             "simulated_exit_price": simulated_exit_price,
             "simulated_exit_reason": simulated_exit_reason,
             "simulated_return_pct": simulated_return_pct,
+            "simulated_return_basis": simulated_return_basis,
+            "cost_bps_per_round_trip": round(
+                (config.entry_cost_rate + config.exit_cost_rate) * 10000, 2
+            ),
         }
 
     @classmethod
@@ -322,6 +453,8 @@ class BacktestEngine:
         max_high = max(highs) if highs else None
         min_low = min(lows) if lows else None
 
+        # 方向/命中度量以「决策点收盘价」为基准：预测是从这里做出的，
+        # 衡量预测质量用决策点是标准做法，本身不含前视偏差。
         stock_return_pct: Optional[float]
         if end_close is None:
             stock_return_pct = None
@@ -452,6 +585,8 @@ class BacktestEngine:
         advice_breakdown = cls._compute_advice_breakdown(completed)
         diagnostics = cls._compute_diagnostics(results_list)
 
+        risk_metrics = cls._compute_risk_metrics(completed)
+
         return {
             "scope": scope,
             "code": code,
@@ -470,12 +605,105 @@ class BacktestEngine:
             "neutral_rate_pct": neutral_rate_pct,
             "avg_stock_return_pct": avg_stock_return_pct,
             "avg_simulated_return_pct": avg_simulated_return_pct,
+            # 基准（买入并持有）对照：判断建议是否跑赢"什么都不做"
+            "benchmark_avg_return_pct": avg_stock_return_pct,
+            "excess_vs_benchmark_pct": cls._excess_vs_benchmark(
+                avg_simulated_return_pct, avg_stock_return_pct
+            ),
+            # 风险/质量指标：只看胜率会被"高胜率小亏低赚"误导
+            "profit_factor": risk_metrics["profit_factor"],
+            "max_drawdown_pct": risk_metrics["max_drawdown_pct"],
+            "avg_win_return_pct": risk_metrics["avg_win_return_pct"],
+            "avg_loss_return_pct": risk_metrics["avg_loss_return_pct"],
+            "largest_loss_pct": risk_metrics["largest_loss_pct"],
+            "largest_win_pct": risk_metrics["largest_win_pct"],
+            "drawdown_series_points": risk_metrics["drawdown_series_points"],
             "stop_loss_trigger_rate": stop_loss_trigger_rate,
             "take_profit_trigger_rate": take_profit_trigger_rate,
             "ambiguous_rate": ambiguous_rate,
+            "ambiguous_count": sum(
+                1 for r in any_target_applicable if (r.first_hit or "") == "ambiguous"
+            ),
             "avg_days_to_first_hit": avg_days_to_first_hit,
             "advice_breakdown": advice_breakdown,
             "diagnostics": diagnostics,
+        }
+
+    @staticmethod
+    def _excess_vs_benchmark(
+        avg_simulated_return_pct: Optional[float],
+        avg_stock_return_pct: Optional[float],
+    ) -> Optional[float]:
+        """Average excess of simulated performance over buy-and-hold."""
+        if avg_simulated_return_pct is None or avg_stock_return_pct is None:
+            return None
+        return round(avg_simulated_return_pct - avg_stock_return_pct, 4)
+
+    @classmethod
+    def _compute_risk_metrics(cls, completed: List[BacktestResultLike]) -> Dict[str, Any]:
+        """Profit factor and drawdown over the per-signal simulated returns.
+
+        The series is the sequence of independent per-signal outcomes (not a
+        portfolio equity curve), so ``max_drawdown_pct`` is an approximation used
+        for outlier detection, not a strategy drawdown. Rows without an
+        ``analysis_date`` cannot be ordered chronologically and are skipped for
+        the drawdown series while still feeding the averages.
+        """
+        returns = [
+            float(r.simulated_return_pct)
+            for r in completed
+            if r.simulated_return_pct is not None
+        ]
+        if not returns:
+            return {
+                "profit_factor": None,
+                "max_drawdown_pct": None,
+                "avg_win_return_pct": None,
+                "avg_loss_return_pct": None,
+                "largest_loss_pct": None,
+                "largest_win_pct": None,
+                "drawdown_series_points": 0,
+            }
+
+        wins = [value for value in returns if value > 0]
+        losses = [value for value in returns if value < 0]
+        avg_win = cls._average(wins)
+        avg_loss = cls._average(losses)
+        profit_factor: Optional[float]
+        if avg_win is None:
+            profit_factor = None
+        elif avg_loss is None:
+            # 没有亏损样本：盈亏比为无穷，置 None 并由调用方按"无亏损"解读
+            profit_factor = None
+        else:
+            profit_factor = round(avg_win / abs(avg_loss), 4)
+
+        dated = [
+            (getattr(r, "analysis_date", None), float(r.simulated_return_pct))
+            for r in completed
+            if r.simulated_return_pct is not None and getattr(r, "analysis_date", None) is not None
+        ]
+        max_drawdown_pct: Optional[float] = None
+        if dated:
+            dated.sort(key=lambda item: item[0])
+            equity = 1.0
+            peak = 1.0
+            worst = 0.0
+            for _, value in dated:
+                equity *= 1.0 + value / 100.0
+                peak = max(peak, equity)
+                if peak > 0:
+                    worst = min(worst, (equity - peak) / peak * 100.0)
+            max_drawdown_pct = round(worst, 4)
+
+        return {
+            "profit_factor": profit_factor,
+            "max_drawdown_pct": max_drawdown_pct,
+            "avg_win_return_pct": avg_win,
+            "avg_loss_return_pct": avg_loss,
+            "largest_loss_pct": min(returns),
+            "largest_win_pct": max(returns),
+            "drawdown_series_points": len(dated),
         }
 
     @staticmethod
@@ -736,6 +964,7 @@ class BacktestEngine:
         for idx, bar in enumerate(window_bars, start=1):
             low = bar.low
             high = bar.high
+            open_price = cls._finite_optional_float(getattr(bar, "open", None))
             stop_hit = stop_loss is not None and low is not None and low <= stop_loss
             tp_hit = take_profit is not None and high is not None and high >= take_profit
 
@@ -750,20 +979,29 @@ class BacktestEngine:
             first_hit_date = bar.date
             first_hit_days = idx
 
+            # 跳空保护：开盘已越过触发价时，成交价只能是开盘价。
+            # 止损跳空 -> 按开盘（更差）；止盈跳空 -> 按开盘（更好）。
+            stop_fill = stop_loss
+            if stop_hit and open_price is not None and open_price < stop_loss:
+                stop_fill = open_price
+            take_fill = take_profit
+            if tp_hit and open_price is not None and open_price > take_profit:
+                take_fill = open_price
+
             if stop_hit and tp_hit:
                 first_hit = "ambiguous"
-                exit_price = stop_loss
+                exit_price = stop_fill
                 exit_reason = "ambiguous_stop_loss"
                 break
 
             if stop_hit:
                 first_hit = "stop_loss"
-                exit_price = stop_loss
+                exit_price = stop_fill
                 exit_reason = "stop_loss"
                 break
 
             first_hit = "take_profit"
-            exit_price = take_profit
+            exit_price = take_fill
             exit_reason = "take_profit"
             break
 

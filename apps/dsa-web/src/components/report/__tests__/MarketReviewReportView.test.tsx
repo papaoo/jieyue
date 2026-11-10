@@ -106,6 +106,47 @@ const noBreadthMarketReviewPayload: MarketReviewPayload = {
 };
 
 describe('MarketReviewReportView', () => {
+  it.each(['2026-10-12Tnot-a-time', '2026-02-30', '2026-10-12T25:00:00Z'])('rejects the entire malformed industry date %s', (asOf) => {
+    const payload = { ...noBreadthMarketReviewPayload, sectors: { top: [{ name: '银行', asOf }] } };
+    render(<MarketReviewReportView payload={payload} content="# 大盘复盘" reportLanguage="zh" />);
+    expect(screen.getByText(/数据日期未知/)).toBeInTheDocument();
+    expect(screen.queryByText(/数据日期：/)).not.toBeInTheDocument();
+  });
+  it.each(['2026-10-12', '2026-10-12T09:30:00+08:00', '2026-10-12T01:30:00Z'])('accepts a full supported industry date %s', (asOf) => {
+    const payload = { ...noBreadthMarketReviewPayload, sectors: { top: [{ name: '银行', asOf }] } };
+    render(<MarketReviewReportView payload={payload} content="# 大盘复盘" reportLanguage="zh" />);
+    expect(screen.getByText(/数据日期：2026-10-12/)).toBeInTheDocument();
+  });
+  it('uses historical row-level date/source/definition when rankings have no container metadata', () => {
+    const row = { name: '银行', changePct: 1.2, asOf: '2026-10-12', source: 'computed_from_tushare',
+      definition: 'equal_weight_return_of_observed_traded_constituents' };
+    const payload = { ...noBreadthMarketReviewPayload, sectors: { top: [row], bottom: [{ ...row, name: '煤炭' }] } };
+    render(<MarketReviewReportView payload={payload} content="# 大盘复盘" reportLanguage="zh" />);
+    expect(screen.getAllByText(/数据日期：2026-10-12/)).toHaveLength(2);
+    expect(screen.getAllByText(/computed_from_tushare/)).toHaveLength(2);
+    expect(screen.getAllByText(/已观测成分等权均值/)).toHaveLength(2);
+    expect(screen.queryByText(/数据日期未知/)).not.toBeInTheDocument();
+  });
+  it('honestly summarizes mixed and missing row dates without using report creation time', () => {
+    const payload = { ...noBreadthMarketReviewPayload, sectors: { top: [
+      { name: '银行', asOf: '2026-10-11', source: 'one' },
+      { name: '煤炭', asOf: '2026-10-12', source: 'two' }, { name: '软件' },
+    ] } };
+    render(<MarketReviewReportView report={englishMarketReviewReport} payload={payload} content="# 大盘复盘" reportLanguage="zh" />);
+    expect(screen.getByText(/2026-10-11 至 2026-10-12.*日期混合.*部分日期未知/)).toBeInTheDocument();
+    expect(screen.queryByText(/数据日期：2026-03-18/)).not.toBeInTheDocument();
+  });
+  it('discloses the historical sector observation date and equal-weight scope', () => {
+    const payload = { ...noBreadthMarketReviewPayload, sectors: {
+      ...noBreadthMarketReviewPayload.sectors, asOf: '2026-10-12', source: 'computed_from_tushare',
+      definition: 'equal_weight_return_of_observed_traded_constituents', coverage: { observedCount: 100 },
+    } };
+    render(<MarketReviewReportView payload={payload} content="# Market Review" reportLanguage="zh" />);
+    expect(screen.getAllByText(/2026-10-12/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/历史数据/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/等权/).length).toBeGreaterThan(0);
+    expect(screen.queryByText(/历史数据.*未知/)).not.toBeInTheDocument();
+  });
   it('uses localized summary card labels and fallbacks for English reports', () => {
     render(
       <MarketReviewReportView

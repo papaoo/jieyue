@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from src.services.screening.models import Pick
+from src.services.screening.industry_reference import industry_identity
 
 _DEFAULT_RISK_PROFILE = {
     "chase_change_pct": 8.0,
@@ -69,6 +70,15 @@ def apply_risk_overlay(
         pick.risk_penalty = round(penalty, 4)
         pick.risk_score = round(0.0 if max_penalty == 0 else min(points / max_penalty * 100, 100), 4)
         pick.risk_level = _risk_level(points, max_penalty)
+        fundamentals = (pick.dsa_context or {}).get("fundamentals") or {}
+        coverage = fundamentals.get("coverage") or {}
+        evidence_gaps = [name for name in ("valuation", "growth", "earnings", "capital_flow", "boards")
+                         if coverage.get(name) not in {"ok", "available"}]
+        if evidence_gaps:
+            flags.append("数据覆盖不足，未确认低风险：" + ", ".join(evidence_gaps))
+            if pick.risk_level == "low":
+                pick.risk_level = "unknown"
+            degradation.append(f"{pick.code}: risk evidence incomplete ({', '.join(evidence_gaps)})")
         pick.risk_flags = _unique([*pick.risk_flags, *flags])
         pick.final_score = round(float(pick.final_score) - penalty, 4)
         pick.excluded_by_risk = veto_high_risk and pick.risk_level == "high"
@@ -89,6 +99,8 @@ def apply_portfolio_overlay(
     max_same_sector: int = 1,
     concentration_penalty: float = 4.0,
     profile: dict[str, object] | None = None,
+    canonical_only: bool = False,
+    signal_date=None,
 ) -> tuple[list[Pick], list[str]]:
     """Penalize repeated LLM sectors so Top N is not only one crowded trade."""
     if not picks:
@@ -101,16 +113,18 @@ def apply_portfolio_overlay(
         return picks, []
 
     ordered = sorted(picks, key=lambda item: item.final_score, reverse=True)
-    if not any(_canonical_sector(_pick_sector(pick)) for pick in ordered):
+    if not canonical_only and not any(_canonical_sector(_pick_sector(pick)) for pick in ordered):
         return ordered, []
 
     bucket_counts: dict[str, int] = {}
     bucket_penalties: dict[str, list[tuple[str, str, float]]] = {}
     for pick in ordered:
-        sector = _canonical_sector(_pick_sector(pick))
+        sector = industry_identity(pick, signal_date) if canonical_only else _canonical_sector(_pick_sector(pick))
         if not sector:
+            if canonical_only:
+                pick.portfolio_flags = _unique([*pick.portfolio_flags, 'industry_unassessed'])
             continue
-        bucket = _portfolio_bucket(sector, pick.llm_theme, buckets=portfolio_profile.get("buckets"))
+        bucket = sector if canonical_only else _portfolio_bucket(sector, pick.llm_theme, buckets=portfolio_profile.get("buckets"))
         bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
         excess = bucket_counts[bucket] - max_same_sector
         if excess <= 0:
@@ -135,6 +149,8 @@ def apply_portfolio_overlay(
         )
         for bucket, items in bucket_penalties.items()
     ]
+    if canonical_only and any('industry_unassessed' in p.portfolio_flags for p in ordered):
+        notes.append('industry_unassessed: canonical industry evidence unavailable; concentration not fully assessed')
     return ordered, notes
 
 

@@ -10,8 +10,10 @@ capability, and exposes advanced TickFlow-only helpers for future consumers.
 from __future__ import annotations
 
 import logging
+import hashlib
 import math
 import os
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from threading import RLock
 from time import monotonic
@@ -32,6 +34,7 @@ except Exception:  # pragma: no cover - defensive fallback for old runtimes.
 from .base import (
     BaseFetcher,
     DataFetchError,
+    RateLimitError,
     STANDARD_COLUMNS,
     is_bse_code,
     is_kc_cy_stock,
@@ -53,6 +56,7 @@ _CN_MAIN_INDEX_QUOTES = (
 )
 _CN_UNIVERSE_ID = "CN_Equity_A"
 _MAX_SYMBOLS_PER_QUOTE_REQUEST = 5
+_MAX_SYMBOLS_PER_KLINE_REQUEST = 100
 _CAPABILITY_NEGATIVE_CACHE_TTL_SECONDS = 900
 _SECTOR_RANKINGS_CACHE_TTL_SECONDS = 300
 _MAX_DAILY_PREFETCH_LOOKBACK_DAYS = 730
@@ -86,6 +90,8 @@ class TickFlowFetcher(BaseFetcher):
 
     name = "TickFlowFetcher"
     priority = 2
+    _request_budget_lock = RLock()
+    _request_budget: Dict[str, deque] = {}
 
     def __init__(
         self,
@@ -95,6 +101,8 @@ class TickFlowFetcher(BaseFetcher):
         kline_adjust: Optional[str] = None,
         batch_daily_enabled: Optional[bool] = None,
         batch_size: Optional[int] = None,
+        max_symbols_per_request: Optional[int] = None,
+        requests_per_minute: Optional[int] = None,
         priority: Optional[int] = None,
     ):
         self.api_key = (api_key or "").strip()
@@ -103,12 +111,25 @@ class TickFlowFetcher(BaseFetcher):
         self.kline_adjust = self._normalize_adjust(
             kline_adjust or os.getenv("TICKFLOW_KLINE_ADJUST", "none")
         )
+        # 复权口径随配置变化（默认 none=不复权），按实例声明，
+        # 让落库标记如实反映本源的复权基准，避免与 qfq 源混用后无法检测。
+        self.price_adjustment = self._resolve_price_adjustment(self.kline_adjust)
         self.batch_daily_enabled = (
             self._parse_bool(os.getenv("TICKFLOW_BATCH_DAILY_ENABLED"), True)
             if batch_daily_enabled is None
             else bool(batch_daily_enabled)
         )
-        self.batch_size = max(1, int(batch_size)) if batch_size is not None else _parse_env_int("TICKFLOW_BATCH_SIZE", 100)
+        self.max_symbols_per_request = (
+            max(1, int(max_symbols_per_request)) if max_symbols_per_request is not None
+            else _parse_env_int("TICKFLOW_MAX_SYMBOLS_PER_REQUEST", 5)
+        )
+        self.requests_per_minute = (
+            max(1, int(requests_per_minute)) if requests_per_minute is not None
+            else _parse_env_int("TICKFLOW_REQUESTS_PER_MINUTE", 10)
+        )
+        requested_batch_size = max(1, int(batch_size)) if batch_size is not None else _parse_env_int("TICKFLOW_BATCH_SIZE", 5)
+        self.batch_size = min(requested_batch_size, self.max_symbols_per_request, _MAX_SYMBOLS_PER_KLINE_REQUEST)
+        self._budget_key = hashlib.sha256(self.api_key.encode("utf-8")).hexdigest()
 
         self._client = None
         self._client_lock = RLock()
@@ -128,6 +149,33 @@ class TickFlowFetcher(BaseFetcher):
             "universe_quotes": None,
         }
         self._capability_checked_at: Dict[str, float] = {}
+
+    def _admit_request(self) -> None:
+        """Share a rolling request budget across instances, without blocking fallback."""
+        with self._request_budget_lock:
+            # Timestamp order must be the same as admission order across threads.
+            now = monotonic()
+            # Reclaim expired keys when ephemeral managers/credentials change.
+            expired = [key for key, times in self._request_budget.items() if not times or times[-1] <= now - 60]
+            for key in expired:
+                self._request_budget.pop(key, None)
+            times = self._request_budget.setdefault(self._budget_key, deque())
+            while times and times[0] <= now - 60:
+                times.popleft()
+            if len(times) >= self.requests_per_minute:
+                raise RateLimitError("TickFlow local request budget exhausted; use fallback")
+            times.append(now)
+
+    def _request(self, method, *args, **kwargs):
+        self._admit_request()
+        try:
+            return method(*args, **kwargs)
+        except Exception as exc:
+            if getattr(exc, "status_code", None) == 429:
+                # Other processes may already have used the account allowance.
+                with self._request_budget_lock:
+                    self._request_budget[self._budget_key] = deque([monotonic()] * self.requests_per_minute)
+            raise
 
     def close(self) -> None:
         """Close the underlying TickFlow client if it was created."""
@@ -153,7 +201,7 @@ class TickFlowFetcher(BaseFetcher):
     def _build_client(self):
         from tickflow import TickFlow
 
-        return TickFlow(api_key=self.api_key, timeout=self.timeout)
+        return TickFlow(api_key=self.api_key, timeout=self.timeout, max_retries=0)
 
     def _get_client(self):
         if not self.api_key:
@@ -184,14 +232,16 @@ class TickFlowFetcher(BaseFetcher):
 
         request_count = self._daily_kline_count(start_date, end_date)
         try:
-            df = client.klines.get(
+            df = self._request(client.klines.get,
                 symbol,
                 period="1d",
                 count=request_count,
                 start_time=self._date_to_ms(start_date),
                 end_time=self._date_to_ms(end_date, end_of_day=True),
                 adjust=self.kline_adjust,
-                as_dataframe=True,
+                # SDK DataFrame hydration fetches instrument names behind our budget.
+                # Normalize compact columns locally instead.
+                as_dataframe=False,
             )
         except Exception as exc:
             raise DataFetchError(f"TickFlow daily K-line request failed: {exc}") from exc
@@ -273,6 +323,20 @@ class TickFlowFetcher(BaseFetcher):
             "Invalid TICKFLOW_KLINE_ADJUST=%r; falling back to none",
             value,
         )
+        return "none"
+
+    @staticmethod
+    def _resolve_price_adjustment(kline_adjust: str) -> str:
+        """Map TickFlow adjust mode to the shared price-adjustment vocabulary.
+
+        forward* = 前复权（与 efinance/akshare/tushare 同口径）；
+        backward* = 后复权；none = 不复权。
+        """
+        mode = str(kline_adjust or "none").strip().lower()
+        if mode.startswith("forward"):
+            return "qfq"
+        if mode.startswith("backward"):
+            return "hfq"
         return "none"
 
     @classmethod
@@ -627,14 +691,16 @@ class TickFlowFetcher(BaseFetcher):
             batch_symbols = symbols[offset : offset + self.batch_size]
             try:
                 request_count = self._daily_kline_count(start_date, end_date)
-                batch_result = client.klines.batch(
+                batch_result = self._request(client.klines.batch,
                     batch_symbols,
                     period="1d",
                     count=request_count,
                     start_time=self._date_to_ms(start_date),
                     end_time=self._date_to_ms(end_date, end_of_day=True),
                     adjust=self.kline_adjust,
-                    as_dataframe=True,
+                    as_dataframe=False,
+                    batch_size=len(batch_symbols),
+                    max_workers=1,
                 )
                 self._mark_capability("batch_daily", True)
             except Exception as exc:
@@ -734,12 +800,12 @@ class TickFlowFetcher(BaseFetcher):
         if not symbols:
             return 0
 
-        effective_batch_size = max(1, int(batch_size or self.batch_size))
+        effective_batch_size = min(max(1, int(batch_size or self.batch_size)), self.max_symbols_per_request)
         cached_count = 0
         for offset in range(0, len(symbols), effective_batch_size):
             batch_symbols = symbols[offset : offset + effective_batch_size]
             try:
-                quotes = client.quotes.get(symbols=batch_symbols)
+                quotes = self._request(client.quotes.get, symbols=batch_symbols)
             except Exception as exc:
                 logger.warning("[TickFlowFetcher] batch realtime quote failed: %s", exc)
                 continue
@@ -791,7 +857,7 @@ class TickFlowFetcher(BaseFetcher):
             if client is None:
                 return None
             try:
-                quotes = client.quotes.get(symbols=[symbol])
+                quotes = self._request(client.quotes.get, symbols=[symbol])
             except Exception as exc:
                 logger.warning("[TickFlowFetcher] realtime quote failed for %s: %s", symbol, exc)
                 return None
@@ -886,7 +952,7 @@ class TickFlowFetcher(BaseFetcher):
             return None
 
         try:
-            quotes = client.quotes.get(symbols=[symbol])
+            quotes = self._request(client.quotes.get, symbols=[symbol])
             self._store_quotes(quotes)
             cached = self._get_cached_quote(symbol)
             name = self._extract_name(cached or {})
@@ -896,7 +962,7 @@ class TickFlowFetcher(BaseFetcher):
             logger.debug("[TickFlowFetcher] quote name lookup failed for %s", symbol, exc_info=True)
 
         try:
-            instrument = client.instruments.get(symbol)
+            instrument = self._request(client.instruments.get, symbol)
             return self._extract_instrument_name(instrument)
         except Exception:
             logger.debug("[TickFlowFetcher] instrument lookup failed for %s", symbol, exc_info=True)
@@ -924,7 +990,7 @@ class TickFlowFetcher(BaseFetcher):
             return pd.DataFrame(columns=["code", "name", "industry", "area", "market"])
 
         try:
-            universe = client.universes.get(_CN_UNIVERSE_ID)
+            universe = self._request(client.universes.get, _CN_UNIVERSE_ID)
             entries = self._extract_universe_entries(universe)
         except Exception as exc:
             if self._is_universe_permission_error(exc):
@@ -994,9 +1060,10 @@ class TickFlowFetcher(BaseFetcher):
 
         symbols = [symbol for symbol, _, _ in _CN_MAIN_INDEX_QUOTES]
         quotes: List[Dict[str, Any]] = []
-        for offset in range(0, len(symbols), _MAX_SYMBOLS_PER_QUOTE_REQUEST):
-            batch_symbols = symbols[offset : offset + _MAX_SYMBOLS_PER_QUOTE_REQUEST]
-            batch_quotes = client.quotes.get(symbols=batch_symbols)
+        batch_size = min(_MAX_SYMBOLS_PER_QUOTE_REQUEST, self.max_symbols_per_request)
+        for offset in range(0, len(symbols), batch_size):
+            batch_symbols = symbols[offset : offset + batch_size]
+            batch_quotes = self._request(client.quotes.get, symbols=batch_symbols)
             if batch_quotes:
                 quotes.extend(batch_quotes)
         if not quotes:
@@ -1062,7 +1129,7 @@ class TickFlowFetcher(BaseFetcher):
             return None
 
         try:
-            quotes = client.quotes.get(universes=[_CN_UNIVERSE_ID])
+            quotes = self._request(client.quotes.get, universes=[_CN_UNIVERSE_ID])
             self._mark_capability("universe_quotes", True)
         except Exception as exc:
             if self._is_universe_permission_error(exc):
@@ -1152,7 +1219,7 @@ class TickFlowFetcher(BaseFetcher):
             return None
 
         try:
-            universes = client.universes.list()
+            universes = self._request(client.universes.list)
             sw1_ids = [
                 str(item.get("id"))
                 for item in universes or []
@@ -1161,8 +1228,8 @@ class TickFlowFetcher(BaseFetcher):
             ]
             if not sw1_ids:
                 return None
-            details = client.universes.batch(sw1_ids)
-            quotes = client.quotes.get(universes=[_CN_UNIVERSE_ID])
+            details = self._request(client.universes.batch, sw1_ids)
+            quotes = self._request(client.quotes.get, universes=[_CN_UNIVERSE_ID])
             self._mark_capability("universe_quotes", True)
         except Exception as exc:
             if self._is_universe_permission_error(exc):

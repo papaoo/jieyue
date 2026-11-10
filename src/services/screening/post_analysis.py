@@ -305,10 +305,10 @@ def _scorecard_delta(
 
     if value >= profile["value_quality_value_min"] and stability >= profile["value_quality_stability_min"]:
         delta += profile["value_quality_bonus"]
-        tags.append("value_quality")
+        tags.append("valuation_stability")
     if momentum >= profile["capital_confirmed_momentum_min"] and activity >= profile["capital_confirmed_activity_min"]:
         delta += profile["capital_confirmed_bonus"]
-        tags.append("capital_confirmed")
+        tags.append("price_volume_active")
     if reversal >= profile["controlled_reversal_min"] and pick.change_pct < 0:
         delta += profile["controlled_reversal_bonus"]
         tags.append("controlled_reversal")

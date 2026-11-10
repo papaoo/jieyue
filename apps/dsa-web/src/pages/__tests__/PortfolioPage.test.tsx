@@ -336,6 +336,34 @@ describe('PortfolioPage FX refresh', () => {
     getLatestDecisionSignals.mockResolvedValue({ items: [], total: 0, page: 1, pageSize: 1 });
   });
 
+  it('hides complete totals when the backend reports an incomplete valuation', async () => {
+    getSnapshot.mockResolvedValue({
+      ...makeSnapshot({ fxStale: false }),
+      valuationComplete: false,
+      totalEquity: 987654321,
+      totalMarketValue: 123456789,
+      dataQuality: 'partial',
+      limitations: ['missing_price'],
+    });
+    render(<PortfolioPage />);
+    await waitForInitialLoad();
+    expect(screen.queryByText('CNY 987,654,321.00')).not.toBeInTheDocument();
+    expect(screen.queryByText('CNY 123,456,789.00')).not.toBeInTheDocument();
+    expect(await screen.findByText('缺少行情，完整估值不可用')).toBeInTheDocument();
+  });
+
+  it('respects an unavailable risk block even when the separate snapshot is complete', async () => {
+    getSnapshot.mockResolvedValue({ ...makeSnapshot({ fxStale: false }), valuationComplete: true });
+    const report = makeRisk();
+    getRisk.mockResolvedValue({ ...report, stopLoss: { ...report.stopLoss, available: false, reason: 'incomplete_valuation' } });
+    render(<PortfolioPage />);
+    await waitForInitialLoad();
+    const flag = screen.getByText('止损', { exact: true }).closest('.rounded-xl');
+    expect(flag).not.toBeNull();
+    expect(within(flag as HTMLElement).queryByText('正常', { exact: true })).not.toBeInTheDocument();
+    expect(within(flag as HTMLElement).getAllByText('不可用').length).toBeGreaterThan(0);
+  });
+
   function renderEnglishPage() {
     window.localStorage.setItem(UI_LANGUAGE_STORAGE_KEY, 'en');
     render(

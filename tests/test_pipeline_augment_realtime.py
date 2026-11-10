@@ -40,7 +40,7 @@ class AugmentRealtimeMarketDateTestCase(unittest.TestCase):
         mock_now.return_value = us_market_now
 
         df = _make_df([(date(2026, 3, 26), 150.0)])
-        quote = SimpleNamespace(price=155.0, open_price=151.0, high=156.0, low=149.0, volume=200, amount=None, change_pct=3.0, pre_close=None)
+        quote = SimpleNamespace(price=155.0, open_price=151.0, high=156.0, low=149.0, volume=200, amount=None, change_pct=3.0, pre_close=None, provider_timestamp='2026-03-27T20:00:00-04:00')
 
         pipeline = _make_pipeline()
         result = pipeline._augment_historical_with_realtime(df, quote, "AAPL")
@@ -61,7 +61,7 @@ class AugmentRealtimeMarketDateTestCase(unittest.TestCase):
         mock_now.return_value = datetime(2026, 3, 27, 17, 0)
 
         df = _make_df([(date(2026, 3, 26), 150.0), (date(2026, 3, 27), 152.0)])
-        quote = SimpleNamespace(price=155.0, open_price=151.0, high=156.0, low=149.0, volume=200, amount=None, change_pct=3.0, pre_close=None)
+        quote = SimpleNamespace(price=155.0, open_price=151.0, high=156.0, low=149.0, volume=200, amount=None, change_pct=3.0, pre_close=None, provider_timestamp='2026-03-27T16:00:00-04:00')
 
         pipeline = _make_pipeline()
         result = pipeline._augment_historical_with_realtime(df, quote, "AAPL")
@@ -79,7 +79,7 @@ class AugmentRealtimeMarketDateTestCase(unittest.TestCase):
         mock_now.return_value = datetime(2026, 3, 28, 10, 0)
 
         df = _make_df([(date(2026, 3, 27), 30.0)])
-        quote = SimpleNamespace(price=31.0, open_price=30.5, high=31.5, low=29.5, volume=100, amount=None, change_pct=1.0, pre_close=None)
+        quote = SimpleNamespace(price=31.0, open_price=30.5, high=31.5, low=29.5, volume=100, amount=None, change_pct=1.0, pre_close=None, provider_timestamp='2026-03-28T09:59:00+08:00')
 
         pipeline = _make_pipeline()
         result = pipeline._augment_historical_with_realtime(df, quote, "600519")

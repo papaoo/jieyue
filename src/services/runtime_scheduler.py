@@ -243,6 +243,71 @@ def build_agent_event_monitor_background_tasks(
     }]
 
 
+def _outcome_evaluation_interval_seconds(config: Config) -> int:
+    raw = getattr(config, "outcome_evaluation_interval_minutes", 60)
+    try:
+        interval_minutes = int(raw)
+    except (TypeError, ValueError):  # pragma: no cover - defensive branch
+        logger.warning(
+            "Invalid OUTCOME_EVALUATION_INTERVAL_MINUTES=%r; use fallback 60",
+            raw,
+        )
+        interval_minutes = 60
+    return max(1, interval_minutes) * 60
+
+
+def build_outcome_evaluation_background_tasks(
+    config: Config,
+) -> List[Dict[str, Any]]:
+    """Build the background task that closes the LLM-研判 → 真实收益 evaluation loop.
+
+    历史问题：``SkillOpinionOutcomeService.run_outcomes`` 只有常量被引用、生产代码
+    零调用方（仅手动 API 可触发），``skill_opinion_outcomes`` 表永远为空，
+    于是「LLM 研判质量 → 真实收益校准 → skill 权重」的自评估链路实际不可达，
+    且没有任何告警暴露这一事实。
+
+    现在由常驻进程按固定间隔自动评估（默认 60 分钟），并遵循「只用本地已存日线、
+    不拉外部数据」的既有约束。决策信号的结果评估同样纳入该任务。
+    """
+    if not getattr(config, "outcome_evaluation_enabled", True):
+        return []
+
+    interval_seconds = _outcome_evaluation_interval_seconds(config)
+
+    def outcome_evaluation_task() -> None:
+        from src.services.decision_signal_outcome_service import DecisionSignalOutcomeService
+        from src.services.skill_opinion_outcome_service import SkillOpinionOutcomeService
+
+        try:
+            skill_stats = SkillOpinionOutcomeService().run_outcomes(limit=100)
+        except Exception as exc:  # pragma: no cover - defensive branch
+            logger.warning("[OutcomeEval] skill opinion outcome evaluation failed: %s", exc)
+            skill_stats = {}
+        try:
+            signal_stats = DecisionSignalOutcomeService().run_outcomes(limit=100)
+        except Exception as exc:  # pragma: no cover - defensive branch
+            logger.warning("[OutcomeEval] decision signal outcome evaluation failed: %s", exc)
+            signal_stats = {}
+
+        evaluated = 0
+        for stats in (skill_stats, signal_stats):
+            if isinstance(stats, dict):
+                for key in ("evaluated", "evaluated_count", "updated", "processed"):
+                    value = stats.get(key)
+                    if isinstance(value, int):
+                        evaluated += value
+                        break
+        if evaluated:
+            logger.info("[OutcomeEval] evaluated %d outcome key(s)", evaluated)
+
+    return [{
+        "task": outcome_evaluation_task,
+        "interval_seconds": interval_seconds,
+        "run_immediately": True,
+        "name": "outcome_evaluation",
+    }]
+
+
 class RuntimeSchedulerService:
     """Manage scheduled analysis inside the current API/Web/Desktop process."""
 
@@ -645,7 +710,9 @@ class RuntimeSchedulerService:
     def _current_background_tasks(self, config: Config) -> List[Dict[str, Any]]:
         if self._background_tasks_provider is not None:
             return self._background_tasks_provider(config)
-        return self._current_agent_event_monitor_background_tasks(config)
+        tasks = self._current_agent_event_monitor_background_tasks(config)
+        tasks.extend(build_outcome_evaluation_background_tasks(config))
+        return tasks
 
     def _current_agent_event_monitor_background_tasks(self, config: Config) -> List[Dict[str, Any]]:
         name = "agent_event_monitor"

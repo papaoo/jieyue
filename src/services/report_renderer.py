@@ -19,6 +19,7 @@ from src.market_phase_summary import format_public_market_status_line, format_pu
 from src.report_language import (
     get_localized_stock_name,
     get_report_labels,
+    market_snapshot_presentation,
     get_signal_level,
     get_chip_unavailable_reason,
     is_chip_structure_unavailable,
@@ -34,6 +35,11 @@ from src.report_language import (
     normalize_report_language,
     normalize_strategy_synthesis_payload,
     strategy_invalid_opinion_count,
+    describe_sentiment_plainly,
+    newcomer_guide_lines,
+    report_disclaimer_line,
+    report_data_as_of_line,
+    report_accuracy_line,
 )
 from src.schemas.decision_action import (
     display_action_fields_for_result,
@@ -188,7 +194,7 @@ def render(
                 models_used.append(model)
         models_used = list(dict.fromkeys(models_used))
 
-    report_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    report_timestamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
 
     def failed_checks(checklist: List[str]) -> List[str]:
         return [c for c in (checklist or []) if c.startswith("❌") or c.startswith("⚠️")]
@@ -223,6 +229,7 @@ def render(
         "hold_count": hold_count,
         "labels": labels,
         "report_language": report_language,
+        "market_snapshot_presentation": market_snapshot_presentation,
         "models_used": models_used,
         "show_llm_model": show_llm_model,
         "market_status_line": market_status_line(),
@@ -247,6 +254,15 @@ def render(
         "strategy_invalid_opinion_count": strategy_invalid_opinion_count,
         "signal_attribution_has_content": signal_attribution_has_content,
         "signal_attribution_weight_items": signal_attribution_weight_items,
+        # 推送可读性优化：新手指南 / 白话评分 / 免责 / 数据时效 / 历史准确率
+        "newcomer_guide_lines": newcomer_guide_lines(report_language),
+        "describe_sentiment_plainly": describe_sentiment_plainly,
+        "report_disclaimer_enabled": bool(
+            getattr(get_config(), "report_disclaimer_enabled", True)
+        ),
+        "disclaimer_line": report_disclaimer_line(report_language),
+        "data_as_of_line": report_data_as_of_line(report_language),
+        "accuracy_line": report_accuracy_line(report_language),
     }
     if extra_context:
         safe_extra_context = dict(extra_context)

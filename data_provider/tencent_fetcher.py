@@ -16,7 +16,8 @@ try:
 except ImportError:  # pragma: no cover - dependency is present in supported installs
     xcals = None
 
-from .base import BaseFetcher, DataFetchError, STANDARD_COLUMNS, normalize_stock_code, is_bse_code
+from .base import (BaseFetcher, DataFetchError, STANDARD_COLUMNS, normalize_stock_code, is_bse_code,
+                   safe_exception_details_enabled, summarize_exception)
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,7 @@ class TencentFetcher(BaseFetcher):
     """Fetch qfq daily K-line data from Tencent's direct quote endpoint."""
 
     name = "TencentFetcher"
+    price_adjustment = "qfq"  # 前复权日线（fqt=1 / adjustflag=2 / auto_adjust 等，详见各自实现）
     # This direct endpoint is the last-resort A-share daily fallback. Keeping
     # it at priority 0 made a single Efinance failure skip the richer built-in
     # fallback chain and try Tencent before AkShare/PyTDX/Baostock/YFinance.
@@ -67,6 +69,8 @@ class TencentFetcher(BaseFetcher):
             return _empty_daily_frame()
 
         df = pd.DataFrame(rows)
+        series_payload = (payload.get('data') or {}).get(symbol) or {}
+        df.attrs['price_adjustment'] = 'forward' if series_payload.get('qfqday') else 'none'
         first_returned_date = _first_returned_date(df)
         if first_returned_date and _is_capped_history_incomplete(
             first_returned_date=first_returned_date,
@@ -125,12 +129,12 @@ class TencentFetcher(BaseFetcher):
                 return None
             name = fields[1].strip()
             return name or None
-        except Exception:
-            logger.debug(
-                "TencentFetcher stock name lookup failed for %s",
-                stock_code,
-                exc_info=True,
-            )
+        except Exception as exc:
+            if safe_exception_details_enabled():
+                logger.debug("TencentFetcher stock name lookup failed for %s: %s",
+                             stock_code, summarize_exception(exc)[1])
+            else:
+                logger.debug("TencentFetcher stock name lookup failed for %s", stock_code, exc_info=True)
             return None
 
 

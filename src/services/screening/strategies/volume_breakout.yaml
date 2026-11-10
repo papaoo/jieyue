@@ -4,7 +4,7 @@
 name: volume_breakout
 display_name: 放量突破
 description: 成交量放大突破关键阻力位，趋势启动信号
-version: "1.2"
+version: "2.1"
 category: trend
 tags: [momentum, volume, breakout]
 analysis_skills: [volume_breakout]
@@ -17,6 +17,7 @@ style:
   ui_badge: 突破
 
 screening:
+  evidence_mode: daily_required
   enabled: true
   market_scope: [cn]
   hard_filters:
@@ -27,6 +28,7 @@ screening:
     change_pct_min: 2.0
     change_pct_max: 9.9
     require_price_above_ma20: true
+    require_breakout_confirmation: true
     signal_score_min: 60
     macd_status_whitelist: [bullish, neutral]
     breakout_20d_pct_min: -1.0
@@ -70,7 +72,7 @@ screening:
     hot_money_penalty: 1.4
   ranking_hints: |
     优先关注：
-    1. 突破前有明显横盘整理（至少 10 个交易日）
+    1. 收盘严格高于此前20日最高价，突破前横盘整理至少 8 个交易日
     2. 突破当日量比和换手同步放大，且日 K 信号仍健康
     3. 突破后股价至少站上 MA20，优先考虑均线结构更顺的候选
     4. 板块有联动效应更佳

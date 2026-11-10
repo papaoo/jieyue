@@ -930,7 +930,9 @@ class Config:
     tickflow_kline_adjust: str = "none"
     tickflow_priority: int = 2
     tickflow_batch_daily_enabled: bool = True
-    tickflow_batch_size: int = 100
+    tickflow_batch_size: int = 5
+    tickflow_max_symbols_per_request: int = 5
+    tickflow_requests_per_minute: int = 10
     futu_opend_host: Optional[str] = None
     futu_opend_port: int = 11111
     futu_hk_realtime_source_priority: str = "futu,longbridge,akshare,yfinance"
@@ -948,6 +950,12 @@ class Config:
     screening_enabled: bool = False
 
     # === AI 分析配置 ===
+    free_model_enabled: bool = False
+    free_model_name: str = "deepseek-v4.1-flash-free"
+    free_model_daily_requests: int = 100
+    free_model_max_tokens: int = 8192
+    free_model_timeout_seconds: int = 90
+    free_model_proxy_url: Optional[str] = None
     generation_backend: str = LITELLM_BACKEND_ID
     generation_fallback_backend: str = LITELLM_BACKEND_ID
     generation_backend_timeout_seconds: int = DEFAULT_LOCAL_CLI_TIMEOUT_SECONDS
@@ -1160,13 +1168,20 @@ class Config:
     notification_alert_channels: List[str] = field(default_factory=list)
     notification_system_error_channels: List[str] = field(default_factory=list)
 
-    # 通知降噪机制（Issue #1200 P4）：默认全部关闭，仅对静态通知渠道生效
-    notification_dedup_ttl_seconds: int = 0
+    # 通知降噪机制（Issue #1200 P4）：默认仅对静态通知渠道生效
+    # dedup TTL 默认 6h：同一内容（内容哈希）在 TTL 内只发送一次，
+    # 主要保护长时间运行的 server/scheduler 进程免受重复派发；0 关闭
+    notification_dedup_ttl_seconds: int = 21600
     notification_cooldown_seconds: int = 0
     notification_quiet_hours: str = ""
     notification_timezone: str = ""
     notification_min_severity: str = ""
     notification_daily_digest_enabled: bool = False
+
+    # 决策信号 / skill 意见的事后结果评估（闭环）：由常驻进程按间隔自动执行，
+    # 只使用本地已存日线，不拉外部数据。关闭后权重回流需依赖手动 API。
+    outcome_evaluation_enabled: bool = True
+    outcome_evaluation_interval_minutes: int = 60
 
     # 单股推送模式：每分析完一只股票立即推送，而不是汇总后推送
     single_stock_notify: bool = False
@@ -1178,6 +1193,9 @@ class Config:
     # 仅分析结果摘要：true 时只推送汇总，不含个股详情（Issue #262）
     report_summary_only: bool = False
     report_show_llm_model: bool = True
+
+    # 报告免责声明：默认开启；关闭后推送的报告/简报不再附带合规声明
+    report_disclaimer_enabled: bool = True
 
     # Report Engine P0: Jinja2 renderer and integrity checks
     report_templates_dir: str = "templates"  # Template directory (relative to project root)
@@ -1232,7 +1250,8 @@ class Config:
     backtest_enabled: bool = True
     backtest_eval_window_days: int = 10
     backtest_min_age_days: int = 14
-    backtest_engine_version: str = "v1"
+    # v2：模拟成交改为「信号次日可成交价 + 双边成本」，与 v1 结果不可直接比较
+    backtest_engine_version: str = "v2"
     backtest_neutral_band_pct: float = 2.0
 
     # === ETF 轮动配置（仅 --etf-rotation 使用）===
@@ -1383,6 +1402,8 @@ class Config:
     _BOOTSTRAP_RUNTIME_ENV_PRESENT_KEYS = frozenset()
 
     def __post_init__(self) -> None:
+        from src.llm.free_models import apply_runtime_route
+        apply_runtime_route(self)
         _log = logging.getLogger(__name__)
         if self.agent_arch not in self._VALID_AGENT_ARCH:
             _log.warning(
@@ -1856,7 +1877,9 @@ class Config:
             tickflow_kline_adjust=normalize_tickflow_kline_adjust(os.getenv('TICKFLOW_KLINE_ADJUST')),
             tickflow_priority=parse_env_int(os.getenv('TICKFLOW_PRIORITY'), 2, field_name='TICKFLOW_PRIORITY', minimum=0),
             tickflow_batch_daily_enabled=parse_env_bool(os.getenv('TICKFLOW_BATCH_DAILY_ENABLED'), default=True),
-            tickflow_batch_size=parse_env_int(os.getenv('TICKFLOW_BATCH_SIZE'), 100, field_name='TICKFLOW_BATCH_SIZE', minimum=1),
+            tickflow_batch_size=parse_env_int(os.getenv('TICKFLOW_BATCH_SIZE'), 5, field_name='TICKFLOW_BATCH_SIZE', minimum=1),
+            tickflow_max_symbols_per_request=parse_env_int(os.getenv('TICKFLOW_MAX_SYMBOLS_PER_REQUEST'), 5, field_name='TICKFLOW_MAX_SYMBOLS_PER_REQUEST', minimum=1),
+            tickflow_requests_per_minute=parse_env_int(os.getenv('TICKFLOW_REQUESTS_PER_MINUTE'), 10, field_name='TICKFLOW_REQUESTS_PER_MINUTE', minimum=1),
             futu_opend_host=os.getenv('FUTU_OPEND_HOST') or None,
             futu_opend_port=parse_env_int(os.getenv('FUTU_OPEND_PORT'), 11111, field_name='FUTU_OPEND_PORT', minimum=1, maximum=65535),
             futu_hk_realtime_source_priority=os.getenv('FUTU_HK_REALTIME_SOURCE_PRIORITY', 'futu,longbridge,akshare,yfinance'),
@@ -1873,6 +1896,12 @@ class Config:
                 default=True,
             ),
             generation_backend=generation_backend,
+            free_model_enabled=parse_env_bool(os.getenv('FREE_MODEL_ENABLED'), default=False),
+            free_model_name=os.getenv('FREE_MODEL_NAME', 'deepseek-v4.1-flash-free').strip(),
+            free_model_proxy_url=os.getenv('FREE_MODEL_PROXY_URL', '').strip() or None,
+            free_model_daily_requests=parse_env_int(os.getenv('FREE_MODEL_DAILY_REQUESTS'), 100, field_name='FREE_MODEL_DAILY_REQUESTS', minimum=1, maximum=1000),
+            free_model_max_tokens=parse_env_int(os.getenv('FREE_MODEL_MAX_TOKENS'), 8192, field_name='FREE_MODEL_MAX_TOKENS', minimum=512, maximum=16384),
+            free_model_timeout_seconds=parse_env_int(os.getenv('FREE_MODEL_TIMEOUT_SECONDS'), 90, field_name='FREE_MODEL_TIMEOUT_SECONDS', minimum=10, maximum=180),
             generation_fallback_backend=generation_fallback_backend,
             generation_backend_timeout_seconds=generation_backend_timeout_seconds,
             generation_backend_max_output_bytes=generation_backend_max_output_bytes,
@@ -2142,7 +2171,7 @@ class Config:
             ),
             notification_dedup_ttl_seconds=parse_env_int(
                 os.getenv('NOTIFICATION_DEDUP_TTL_SECONDS'),
-                0,
+                21600,
                 field_name='NOTIFICATION_DEDUP_TTL_SECONDS',
                 minimum=0,
             ),
@@ -2159,11 +2188,25 @@ class Config:
                 os.getenv('NOTIFICATION_DAILY_DIGEST_ENABLED'),
                 default=False,
             ),
+            outcome_evaluation_enabled=parse_env_bool(
+                os.getenv('OUTCOME_EVALUATION_ENABLED'),
+                default=True,
+            ),
+            outcome_evaluation_interval_minutes=parse_env_int(
+                os.getenv('OUTCOME_EVALUATION_INTERVAL_MINUTES'),
+                60,
+                field_name='OUTCOME_EVALUATION_INTERVAL_MINUTES',
+                minimum=1,
+            ),
             single_stock_notify=os.getenv('SINGLE_STOCK_NOTIFY', 'false').lower() == 'true',
             report_type=cls._parse_report_type(os.getenv('REPORT_TYPE', 'simple')),
             report_language=cls._parse_report_language(report_language_raw),
             report_summary_only=os.getenv('REPORT_SUMMARY_ONLY', 'false').lower() == 'true',
             report_show_llm_model=report_show_llm_model,
+            report_disclaimer_enabled=parse_env_bool(
+                os.getenv('REPORT_DISCLAIMER_ENABLED'),
+                default=True,
+            ),
             report_templates_dir=os.getenv('REPORT_TEMPLATES_DIR', 'templates'),
             report_renderer_enabled=os.getenv('REPORT_RENDERER_ENABLED', 'false').lower() == 'true',
             report_integrity_enabled=os.getenv('REPORT_INTEGRITY_ENABLED', 'true').lower() == 'true',
@@ -2217,7 +2260,7 @@ class Config:
             backtest_enabled=os.getenv('BACKTEST_ENABLED', 'true').lower() == 'true',
             backtest_eval_window_days=parse_env_int(os.getenv('BACKTEST_EVAL_WINDOW_DAYS'), 10, field_name='BACKTEST_EVAL_WINDOW_DAYS', minimum=1),
             backtest_min_age_days=parse_env_int(os.getenv('BACKTEST_MIN_AGE_DAYS'), 14, field_name='BACKTEST_MIN_AGE_DAYS', minimum=1),
-            backtest_engine_version=os.getenv('BACKTEST_ENGINE_VERSION', 'v1'),
+            backtest_engine_version=os.getenv('BACKTEST_ENGINE_VERSION', 'v2'),
             backtest_neutral_band_pct=parse_env_float(
                 os.getenv('BACKTEST_NEUTRAL_BAND_PCT'),
                 2.0,

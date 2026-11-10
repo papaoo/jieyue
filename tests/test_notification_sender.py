@@ -545,6 +545,40 @@ class TestFeishuSender(unittest.TestCase):
         self.assertTrue(result)
         mock_webhook_post.assert_called_once()
 
+    @mock.patch("src.notification_sender.feishu_sender.time.sleep", return_value=None)
+    @mock.patch("src.notification_sender.feishu_sender.requests.post")
+    def test_webhook_retries_on_429_then_succeeds(self, mock_post, mock_sleep):
+        """Webhook 路径对 429 做指数退避重试，不再静默丢弃消息。"""
+        mock_post.side_effect = [
+            _response(429),
+            _response(200, {"code": 0}),
+        ]
+        cfg = _config(feishu_webhook_url="https://feishu.example/hook")
+        sender = FeishuSender(cfg)
+
+        result = sender.send_to_feishu("hello")
+
+        self.assertTrue(result)
+        self.assertEqual(mock_post.call_count, 2)
+        mock_sleep.assert_called_once()
+
+    @mock.patch("src.notification_sender.feishu_sender.time.sleep", return_value=None)
+    @mock.patch("src.notification_sender.feishu_sender.requests.post")
+    def test_webhook_does_not_retry_on_non_retryable_4xx(self, mock_post, mock_sleep):
+        """400 等非重试状态立即失败：卡片尝试 + 文本降级各一次，无退避重试。"""
+        mock_post.side_effect = [
+            _response(400),
+            _response(400),
+        ]
+        cfg = _config(feishu_webhook_url="https://feishu.example/hook")
+        sender = FeishuSender(cfg)
+
+        result = sender.send_to_feishu("hello")
+
+        self.assertFalse(result)
+        self.assertEqual(mock_post.call_count, 2)
+        mock_sleep.assert_not_called()
+
     def test_app_bot_missing_sdk_logs_standard_requirements_install(self):
         """App Bot SDK absence fails closed with the standard project install hint."""
         cfg = _config(

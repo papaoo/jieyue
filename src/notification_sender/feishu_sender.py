@@ -16,6 +16,9 @@ import tempfile
 import threading
 import time
 import uuid as uuid_mod
+import copy
+import math
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -76,9 +79,62 @@ except ImportError:
 _APP_SEND_RETRIES = 3
 _APP_SEND_BACKOFF_SECONDS = (1.0, 2.0, 4.0)
 _WEBHOOK_SEND_TIMEOUT_SECONDS = 30
+# Webhook 发送重试：与 App Bot 路径对齐，避免默认通道被飞书 429/5xx 静默吞掉
+_WEBHOOK_SEND_RETRIES = 3
+_WEBHOOK_BACKOFF_SECONDS = (1.0, 2.0, 4.0)
+# 仅对「重试可能成功」的状态码重试；其余 4xx 视为请求本身有问题，立即失败走降级
+_WEBHOOK_RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
+_WEBHOOK_RETRY_AFTER_MAX_SECONDS = 30.0
 
 # Sentinel for "client not yet initialised".
 _NO_CLIENT = object()
+
+
+@dataclass(frozen=True)
+class DeliveryOutcome:
+    """Platform acceptance only, not proof that a human read the message."""
+    status: str
+    error_code: Optional[str] = None
+
+
+def send_once(credentials, approved_payload, *, transport=None, timeout=30, now=time.time):
+    """Explicit target, exactly one HTTP request. Separate from legacy bool/fallback.
+
+    Only timestamp/signature may be added to the pre-approved payload. No global
+    routing, redirects, retries, chunks, card-to-text fallback or exception logs.
+    """
+    from src.services.research_delivery.credentials import validate_webhook_url, CredentialError
+    try:
+        validate_webhook_url(credentials.webhook_url)
+    except CredentialError:
+        return DeliveryOutcome("rejected", "invalid_target")
+    if type(timeout) not in (float, int) or not math.isfinite(timeout) or not 0 < timeout <= 30:
+        return DeliveryOutcome("rejected", "invalid_timeout")
+    if not isinstance(approved_payload, dict) or "timestamp" in approved_payload or "sign" in approved_payload:
+        return DeliveryOutcome("rejected", "invalid_payload")
+    wire = copy.deepcopy(approved_payload)
+    if credentials.signing_secret:
+        timestamp = str(int(now()))
+        sign = base64.b64encode(hmac.new(f"{timestamp}\n{credentials.signing_secret}".encode(), digestmod=hashlib.sha256).digest()).decode()
+        wire.update(timestamp=timestamp, sign=sign)
+    try:
+        response = (transport or requests.post)(credentials.webhook_url, json=wire, timeout=timeout, allow_redirects=False)
+    except Exception:
+        return DeliveryOutcome("delivery_unknown", "network_unknown")
+    if response.status_code >= 500 or response.status_code in (408, 425):
+        return DeliveryOutcome("delivery_unknown", "http_ambiguous")
+    if response.status_code != 200:
+        return DeliveryOutcome("rejected", "http_rejected")
+    try:
+        result = response.json()
+    except Exception:
+        return DeliveryOutcome("delivery_unknown", "invalid_response")
+    if not isinstance(result, dict):
+        return DeliveryOutcome("delivery_unknown", "invalid_response")
+    code = result.get("code") if "code" in result else result.get("StatusCode")
+    if type(code) is not int:
+        return DeliveryOutcome("delivery_unknown", "invalid_business_code")
+    return DeliveryOutcome("sent") if code == 0 else DeliveryOutcome("rejected", "business_rejected")
 
 
 class FeishuSender:
@@ -591,45 +647,95 @@ class FeishuSender:
         return success_count == total_chunks
 
     def _send_feishu_message(self, content: str, *, timeout_seconds: Optional[float] = None) -> bool:
-        """Send a single Feishu webhook message (interactive card, fallback text)."""
+        """Send a single Feishu webhook message (interactive card, fallback text).
+
+        Both payload attempts (card first, plain text second) get an independent
+        retry budget with exponential backoff, mirroring the App Bot path.
+        Transient failures (network errors, HTTP 408/425/429/5xx) are retried
+        and HTTP 429 respects the ``Retry-After`` header; other 4xx statuses
+        fail fast because retrying cannot fix a malformed request.
+        """
         prepared_content = self._apply_keyword_prefix(content)
         security_fields = self._build_security_fields()
+
+        def _parse_retry_after(response: Any) -> float:
+            raw = response.headers.get("Retry-After") if hasattr(response, "headers") else None
+            if not raw:
+                return 0.0
+            try:
+                seconds = float(str(raw).strip())
+            except (TypeError, ValueError):
+                return 0.0
+            return max(0.0, min(seconds, _WEBHOOK_RETRY_AFTER_MAX_SECONDS))
 
         def _post_payload(payload: Dict[str, Any]) -> bool:
             request_payload = dict(payload)
             request_payload.update(security_fields)
-            try:
-                response = requests.post(
-                    self._feishu_url,
-                    json=request_payload,
-                    timeout=timeout_seconds or _WEBHOOK_SEND_TIMEOUT_SECONDS,
-                    verify=self._webhook_verify_ssl,
-                )
-            except (requests.exceptions.ConnectionError,
-                     requests.exceptions.Timeout,
-                     requests.exceptions.RequestException) as e:
-                logger.error("飞书 Webhook 网络请求异常: %s", e)
-                return False
-            if response.status_code == 200:
+
+            for attempt in range(_WEBHOOK_SEND_RETRIES):
                 try:
-                    result = response.json()
-                except (ValueError, AttributeError):
-                    logger.error("飞书 Webhook 返回非 JSON 响应: %s", response.text[:200])
+                    response = requests.post(
+                        self._feishu_url,
+                        json=request_payload,
+                        timeout=timeout_seconds or _WEBHOOK_SEND_TIMEOUT_SECONDS,
+                        verify=self._webhook_verify_ssl,
+                    )
+                except (requests.exceptions.ConnectionError,
+                         requests.exceptions.Timeout,
+                         requests.exceptions.RequestException) as e:
+                    if attempt < _WEBHOOK_SEND_RETRIES - 1:
+                        logger.warning(
+                            "飞书 Webhook 网络请求异常 (attempt=%d/%d): %s",
+                            attempt + 1, _WEBHOOK_SEND_RETRIES, e,
+                        )
+                        time.sleep(
+                            _WEBHOOK_BACKOFF_SECONDS[
+                                min(attempt, len(_WEBHOOK_BACKOFF_SECONDS) - 1)
+                            ]
+                        )
+                        continue
+                    logger.error("飞书 Webhook 网络请求异常: %s", e)
                     return False
-                if not isinstance(result, dict):
-                    logger.error("飞书 Webhook 返回非预期格式: %s", type(result).__name__)
+
+                if response.status_code == 200:
+                    try:
+                        result = response.json()
+                    except (ValueError, AttributeError):
+                        logger.error("飞书 Webhook 返回非 JSON 响应: %s", response.text[:200])
+                        return False
+                    if not isinstance(result, dict):
+                        logger.error("飞书 Webhook 返回非预期格式: %s", type(result).__name__)
+                        return False
+                    code = result.get("code") if "code" in result else result.get("StatusCode")
+                    if code == 0:
+                        logger.info("飞书 Webhook 消息发送成功")
+                        return True
+                    logger.error(
+                        "飞书 Webhook 返回错误 [code=%s]: %s",
+                        code,
+                        result.get("msg") or result.get("StatusMessage", "未知错误"),
+                    )
                     return False
-                code = result.get("code") if "code" in result else result.get("StatusCode")
-                if code == 0:
-                    logger.info("飞书 Webhook 消息发送成功")
-                    return True
-                logger.error(
-                    "飞书 Webhook 返回错误 [code=%s]: %s",
-                    code,
-                    result.get("msg") or result.get("StatusMessage", "未知错误"),
-                )
+
+                if response.status_code in _WEBHOOK_RETRYABLE_STATUS:
+                    if attempt < _WEBHOOK_SEND_RETRIES - 1:
+                        retry_after = _parse_retry_after(response)
+                        backoff = _WEBHOOK_BACKOFF_SECONDS[
+                            min(attempt, len(_WEBHOOK_BACKOFF_SECONDS) - 1)
+                        ]
+                        logger.warning(
+                            "飞书 Webhook 请求失败 (attempt=%d/%d): HTTP %d，%.1fs 后重试",
+                            attempt + 1, _WEBHOOK_SEND_RETRIES,
+                            response.status_code, max(retry_after, backoff),
+                        )
+                        time.sleep(max(retry_after, backoff))
+                        continue
+                    logger.error("飞书 Webhook 请求最终失败: HTTP %d", response.status_code)
+                    return False
+
+                logger.error("飞书 Webhook 请求失败: HTTP %d", response.status_code)
                 return False
-            logger.error("飞书 Webhook 请求失败: HTTP %d", response.status_code)
+
             return False
 
         card_payload = {"msg_type": "interactive", "card": self._build_card_body(prepared_content)}

@@ -9,6 +9,7 @@ import { getParsedApiError } from '../api/error';
 import { ApiErrorAlert, Card, Badge, ConfirmDialog, EmptyState, InlineAlert, StatusDot } from '../components/common';
 import { PortfolioSignalSummary } from '../components/decision-signals/DecisionSignalDisplay';
 import { useUiLanguage } from '../contexts/UiLanguageContext';
+import { useMotionPreference } from '../contexts/MotionPreferenceContext';
 import { formatUiText } from '../i18n/uiText';
 import { PORTFOLIO_TEXT } from '../locales/featureText';
 import type { FxRefreshFeedback } from '../utils/portfolioFormat';
@@ -85,6 +86,14 @@ type PortfolioSignalLookupResult = {
 type PortfolioPageLanguage = 'zh' | 'en';
 
 const PORTFOLIO_LIMITATION_LABELS: Record<string, Record<PortfolioPageLanguage, string>> = {
+  missing_price: {
+    zh: '缺少行情，完整估值不可用',
+    en: 'Missing prices; complete valuation is unavailable',
+  },
+  missing_fx: {
+    zh: '缺少汇率，未进行假定换算',
+    en: 'Missing FX rates; no assumed conversion was used',
+  },
   realtime_quote_best_effort: {
     zh: '实时行情为尽力获取',
     en: 'Realtime quotes are best-effort',
@@ -252,6 +261,7 @@ function hasUsablePositionQuote(position: PortfolioPositionItem): boolean {
 
 function hasCompletePositionPriceCoverage(snapshot: PortfolioSnapshotResponse | null): boolean {
   return snapshot !== null
+    && snapshot.valuationComplete !== false
     && Array.isArray(snapshot.accounts)
     && snapshot.accounts.every((account) => (
       Array.isArray(account.positions)
@@ -342,17 +352,20 @@ function getPortfolioRiskAvailability(
 
   return {
     concentration: fxQualityAvailable
+      && concentration?.available !== false
       && priceCoverageAvailable
       && hasNumberField(concentration, 'topWeightPct')
       && hasBooleanField(concentration, 'alert')
       && getValidTopPositionRows(risk).length > 0,
     sectorConcentration: fxQualityAvailable
+      && sectorConcentration?.available !== false
       && priceCoverageAvailable
       && hasNumberField(sectorConcentration, 'topWeightPct')
       && hasBooleanField(sectorConcentration, 'alert')
       && hasCompleteSectorCoverage(risk)
       && getClassifiedSectorRows(risk).length > 0,
-    drawdown: hasNumberField(drawdown, 'currentDrawdownPct')
+    drawdown: drawdown?.available !== false
+      && hasNumberField(drawdown, 'currentDrawdownPct')
       && hasNumberField(drawdown, 'maxDrawdownPct')
       && hasNumberField(drawdown, 'seriesPoints')
       && drawdown.seriesPoints > 1
@@ -360,6 +373,7 @@ function getPortfolioRiskAvailability(
       && drawdown.fxStale === false
       && hasBooleanField(drawdown, 'alert'),
     stopLoss: priceCoverageAvailable
+      && stopLoss?.available !== false
       && hasNumberField(stopLoss, 'triggeredCount')
       && hasNumberField(stopLoss, 'nearCount')
       && hasBooleanField(stopLoss, 'nearAlert'),
@@ -373,7 +387,7 @@ function buildExposureRows(
   snapshot: PortfolioSnapshotResponse | null,
   groupBy: 'market' | 'currency',
 ): PortfolioExposureRow[] {
-  if (!snapshot) return [];
+  if (!snapshot || snapshot.valuationComplete === false) return [];
   if (!hasFreshFxEvidence(snapshot)) return [];
   if (!hasCompletePositionPriceCoverage(snapshot)) return [];
   const accounts = snapshot.accounts || [];
@@ -623,6 +637,7 @@ async function loadPortfolioSignalLookup(lookup: PortfolioSignalLookup): Promise
 
 const PortfolioPage: React.FC = () => {
   const { language, t } = useUiLanguage();
+  const { motionEnabled } = useMotionPreference();
   const text = PORTFOLIO_TEXT[language];
   const riskDashboardText = PORTFOLIO_RISK_DASHBOARD_TEXT[language];
   const decisionActionLabels = useMemo(() => buildDecisionActionLabelMap(t), [t]);
@@ -925,7 +940,7 @@ const PortfolioPage: React.FC = () => {
   }, [snapshot]);
   // A missing snapshot is unknown, not a successfully loaded empty portfolio.
   const positionCount = snapshot === null ? '--' : positionRows.length;
-  const exposureTotal = snapshot?.totalMarketValue;
+  const exposureTotal = snapshot?.valuationComplete === false ? undefined : snapshot?.totalMarketValue;
   const exposureEmptyLabel = snapshot !== null && positionRows.length === 0 && hasFreshFxEvidence(snapshot)
     ? riskDashboardText.noExposure
     : riskDashboardText.exposureUnavailable;
@@ -1614,15 +1629,15 @@ const PortfolioPage: React.FC = () => {
       <section className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
         <Card variant="gradient" padding="md">
           <p className="text-xs text-secondary">{text.totalEquity}</p>
-          <p className="mt-1 text-xl font-semibold text-foreground">{formatMoney(snapshot?.totalEquity, snapshot?.currency || 'CNY')}</p>
+          <p className="mt-1 text-xl font-semibold text-foreground">{formatMoney(snapshot?.valuationComplete === false ? undefined : snapshot?.totalEquity, snapshot?.currency || 'CNY')}</p>
         </Card>
         <Card variant="gradient" padding="md">
           <p className="text-xs text-secondary">{text.totalMarketValue}</p>
-          <p className="mt-1 text-xl font-semibold text-foreground">{formatMoney(snapshot?.totalMarketValue, snapshot?.currency || 'CNY')}</p>
+          <p className="mt-1 text-xl font-semibold text-foreground">{formatMoney(snapshot?.valuationComplete === false ? undefined : snapshot?.totalMarketValue, snapshot?.currency || 'CNY')}</p>
         </Card>
         <Card variant="gradient" padding="md">
           <p className="text-xs text-secondary">{text.totalCash}</p>
-          <p className="mt-1 text-xl font-semibold text-foreground">{formatMoney(snapshot?.totalCash, snapshot?.currency || 'CNY')}</p>
+          <p className="mt-1 text-xl font-semibold text-foreground">{formatMoney(snapshot?.valuationComplete === false ? undefined : snapshot?.totalCash, snapshot?.currency || 'CNY')}</p>
         </Card>
         <Card variant="gradient" padding="md">
           <div className="flex items-start justify-between gap-3">
@@ -1763,7 +1778,7 @@ const PortfolioPage: React.FC = () => {
                       <td className="py-2 pr-2 text-right">{formatPositionMoney(row.marketValueBase, row)}</td>
                       <td
                         className={`py-2 pr-3 text-right ${
-                          hasPositionPrice(row)
+                          hasPositionPrice(row) && row.valuationComplete !== false
                             ? row.unrealizedPnlBase >= 0
                               ? 'text-success'
                               : 'text-danger'
@@ -1813,7 +1828,7 @@ const PortfolioPage: React.FC = () => {
             <div className="h-64">
               <ResponsiveContainer width="100%" height="100%">
                 <PieChart>
-                  <Pie data={concentrationPieData} dataKey="value" nameKey="name" cx="50%" cy="50%" outerRadius={90}>
+                  <Pie data={concentrationPieData} dataKey="value" nameKey="name" cx="50%" cy="50%" outerRadius={90} isAnimationActive={motionEnabled}>
                     {concentrationPieData.map((entry, index) => (
                       <Cell key={`cell-${entry.name}`} fill={PIE_COLORS[index % PIE_COLORS.length]} />
                     ))}

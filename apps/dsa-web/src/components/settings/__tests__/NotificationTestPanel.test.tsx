@@ -4,6 +4,7 @@ import type { ReactNode } from 'react';
 import { useUiLanguage, UiLanguageProvider } from '../../../contexts/UiLanguageContext';
 import { UI_LANGUAGE_STORAGE_KEY } from '../../../utils/uiLanguage';
 import { NotificationTestPanel } from '../NotificationTestPanel';
+import { BRAND } from '../../../config/brand';
 
 const testNotificationChannel = vi.hoisted(() => vi.fn());
 
@@ -93,20 +94,20 @@ describe('NotificationTestPanel', () => {
     const titleInput = screen.getByLabelText('标题');
     const contentInput = screen.getByLabelText('正文');
 
-    expect(titleInput).toHaveValue('DSA 通知测试');
-    expect(contentInput).toHaveValue('这是一条来自 DSA Web 设置页的通知测试消息。');
+    expect(titleInput).toHaveValue(`${BRAND.name} 通知测试`);
+    expect(contentInput).toHaveValue(`这是一条来自 ${BRAND.name} Web 设置页的通知测试消息。`);
 
     fireEvent.click(screen.getByRole('button', { name: 'switch-en' }));
 
     await waitFor(() => {
-      expect(titleInput).toHaveValue('DSA notification test');
-      expect(contentInput).toHaveValue('This is a test notification from the DSA Web settings page.');
+      expect(titleInput).toHaveValue(`${BRAND.englishName} notification test`);
+      expect(contentInput).toHaveValue(`This is a test notification from the ${BRAND.englishName} Web settings page.`);
     });
 
     fireEvent.click(screen.getByRole('button', { name: /发送测试|Send test/ }));
     await waitFor(() => expect(testNotificationChannel).toHaveBeenCalledWith(expect.objectContaining({
-      title: 'DSA notification test',
-      content: 'This is a test notification from the DSA Web settings page.',
+      title: `${BRAND.englishName} notification test`,
+      content: `This is a test notification from the ${BRAND.englishName} Web settings page.`,
       timeoutSeconds: 20,
     })));
   });

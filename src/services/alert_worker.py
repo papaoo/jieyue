@@ -27,6 +27,7 @@ from src.analysis_context_pack_overview import (
     extract_analysis_context_pack_overview,
 )
 from src.core.trading_calendar import build_market_phase_context, get_market_for_stock
+from src.config import get_config
 from src.market_phase_summary import (
     format_public_phase_pack_excerpt,
     render_market_phase_summary,
@@ -652,8 +653,8 @@ class AlertWorker:
         from src.notification import NotificationBuilder, NotificationService
 
         notification_service = self.notifier or NotificationService()
-        title = f"Event Alert | {self._display_target(runtime_rule)}"
-        content = result.get("reason") or result.get("message") or runtime_rule.rule.description or "Alert triggered"
+        target = self._display_target(runtime_rule)
+        reason = result.get("reason") or result.get("message") or runtime_rule.rule.description or "Alert triggered"
         diagnostics = self._diagnostics_payload(result.get("diagnostics"))
         visibility = diagnostics.get("analysis_visibility") if isinstance(diagnostics.get("analysis_visibility"), dict) else None
         if visibility is None:
@@ -664,11 +665,21 @@ class AlertWorker:
             source=visibility.get("source"),
         )
         if excerpt:
-            content = f"{content}\n\n{excerpt}"
+            reason = f"{reason}\n\n{excerpt}"
         signal_excerpt = format_decision_signal_excerpt(diagnostics.get("decision_signal_summary"))
-        if signal_excerpt:
-            content = f"{content}\n\n{signal_excerpt}"
-        alert_text = NotificationBuilder.build_simple_alert(title=title, content=content, alert_type="warning")
+        # 结构化信号卡：规则事实（当前值/阈值/数据时间）与 AI 解读分区呈现
+        alert_text = NotificationBuilder.build_signal_alert(
+            title=target,
+            reason=reason,
+            target=target,
+            observed_value=result.get("observed_value"),
+            threshold=result.get("threshold"),
+            data_timestamp=result.get("data_timestamp"),
+            data_source=result.get("data_source"),
+            ai_summary=signal_excerpt or None,
+            alert_type="warning",
+            report_language=getattr(get_config(), "report_language", "zh"),
+        )
 
         return notification_service.send_with_results(alert_text, route_type="alert")
 

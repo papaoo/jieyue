@@ -165,6 +165,15 @@ class BacktestService:
                         eval_window_days=int(eval_window_days),
                     )
 
+                # 复权基准一致性守卫：窗口内若同时存在 qfq 与 none（如历史行来自
+                # 不复权源、近期行来自前复权源），除权日附近的收益计算完全失真。
+                # 这里只做可观测告警，不阻断流程（存量库需要时间自然收敛）。
+                self._warn_on_mixed_price_adjustment(
+                    normalized_code or analysis.code,
+                    daily_window,
+                    eval_window_days,
+                )
+
                 if daily_window is None:
                     insufficient += 1
                     results_to_save.append(
@@ -830,6 +839,44 @@ class BacktestService:
         logger.warning(f"无法确定分析日期，跳过记录: {analysis.code}#{getattr(analysis, 'id', '?')}")
         return None
 
+    def _warn_on_mixed_price_adjustment(
+        self,
+        code: str,
+        daily_window: Any,
+        eval_window_days: int,
+    ) -> None:
+        """Warn when the evaluation window mixes declared price-adjustment modes.
+
+        ``qfq`` + ``none`` in the same window means part of the series was written
+        by an unadjusted source; returns around ex-dividend days are then wrong
+        and the error is invisible in the price values themselves. Unknown
+        (NULL) legacy rows are ignored — they are not evidence of mixing.
+        """
+        if daily_window is None or not code:
+            return
+        summary_fn = getattr(self.db, "get_price_adjustment_summary", None)
+        if not callable(summary_fn):
+            return
+        try:
+            start_bar = getattr(daily_window, "start_bar", None)
+            start_date = getattr(start_bar, "date", None)
+            forward_bars = list(getattr(daily_window, "forward_bars", []) or [])
+            end_date = getattr(forward_bars[-1], "date", None) if forward_bars else None
+            summary = summary_fn(code, start_date, end_date)
+        except Exception as exc:
+            logger.debug("复权口径检查失败(%s): %s", code, exc)
+            return
+
+        if not summary or not summary.get("mixed"):
+            return
+        logger.warning(
+            "回测窗口存在复权基准混用(%s): modes=%s, unknown_rows=%s。"
+            "除权日附近收益可能失真，建议清空该标的日线后重拉以统一基准。",
+            code,
+            summary.get("modes"),
+            summary.get("unknown_rows"),
+        )
+
     def _try_fill_daily_data(self, *, code: str, analysis_date: date, eval_window_days: int) -> None:
         refill_code = str(code or "").strip()
         if not refill_code:
@@ -920,9 +967,19 @@ class BacktestService:
             neutral_rate_pct=summary_data.get("neutral_rate_pct"),
             avg_stock_return_pct=summary_data.get("avg_stock_return_pct"),
             avg_simulated_return_pct=summary_data.get("avg_simulated_return_pct"),
+            benchmark_avg_return_pct=summary_data.get("benchmark_avg_return_pct"),
+            excess_vs_benchmark_pct=summary_data.get("excess_vs_benchmark_pct"),
+            profit_factor=summary_data.get("profit_factor"),
+            max_drawdown_pct=summary_data.get("max_drawdown_pct"),
+            avg_win_return_pct=summary_data.get("avg_win_return_pct"),
+            avg_loss_return_pct=summary_data.get("avg_loss_return_pct"),
+            largest_loss_pct=summary_data.get("largest_loss_pct"),
+            largest_win_pct=summary_data.get("largest_win_pct"),
+            drawdown_series_points=summary_data.get("drawdown_series_points"),
             stop_loss_trigger_rate=summary_data.get("stop_loss_trigger_rate"),
             take_profit_trigger_rate=summary_data.get("take_profit_trigger_rate"),
             ambiguous_rate=summary_data.get("ambiguous_rate"),
+            ambiguous_count=summary_data.get("ambiguous_count"),
             avg_days_to_first_hit=summary_data.get("avg_days_to_first_hit"),
             advice_breakdown_json=json.dumps(summary_data.get("advice_breakdown") or {}, ensure_ascii=False),
             diagnostics_json=json.dumps(summary_data.get("diagnostics") or {}, ensure_ascii=False),
@@ -1014,9 +1071,19 @@ class BacktestService:
             "neutral_rate_pct": row.neutral_rate_pct,
             "avg_stock_return_pct": row.avg_stock_return_pct,
             "avg_simulated_return_pct": row.avg_simulated_return_pct,
+            "benchmark_avg_return_pct": row.benchmark_avg_return_pct,
+            "excess_vs_benchmark_pct": row.excess_vs_benchmark_pct,
+            "profit_factor": row.profit_factor,
+            "max_drawdown_pct": row.max_drawdown_pct,
+            "avg_win_return_pct": row.avg_win_return_pct,
+            "avg_loss_return_pct": row.avg_loss_return_pct,
+            "largest_loss_pct": row.largest_loss_pct,
+            "largest_win_pct": row.largest_win_pct,
+            "drawdown_series_points": row.drawdown_series_points,
             "stop_loss_trigger_rate": row.stop_loss_trigger_rate,
             "take_profit_trigger_rate": row.take_profit_trigger_rate,
             "ambiguous_rate": row.ambiguous_rate,
+            "ambiguous_count": row.ambiguous_count,
             "avg_days_to_first_hit": row.avg_days_to_first_hit,
             "advice_breakdown": json.loads(row.advice_breakdown_json) if row.advice_breakdown_json else {},
             "diagnostics": json.loads(row.diagnostics_json) if row.diagnostics_json else {},

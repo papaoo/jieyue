@@ -785,11 +785,14 @@ def test_reasonless_accepted_llm_ranking_keeps_inferred_quality(monkeypatch, rat
         for _ in range(2):
             result = _attach_candidate_explanations(candidate, factor_weights={"value": 1})
             inferred = [item for item in result["why_selected"] if item["source"] == "llm"]
-            assert inferred == [{"code": "llm_ranking", "text": "模型已参与排序（未提供入选理由）",
-                                 "source": "llm", "quality": "inferred"}]
+            if pick.llm_score is None:
+                assert inferred == []  # Missing score is not synthesized from list position.
+            else:
+                assert inferred == [{"code": "llm_ranking", "text": "模型已参与排序（未提供入选理由）",
+                                     "source": "llm", "quality": "inferred"}]
             assert any(item["code"] == "top_factors" and item["quality"] == "observed"
                        for item in result["why_selected"])
-            assert result["explanation_quality"]["why_selected"] == "partial"
+            assert result["explanation_quality"]["why_selected"] == ("ok" if pick.llm_score is None else "partial")
             assert all(item["text"] != rationale.get("risk") for item in result["why_selected"])
             candidate = _normalize_candidate({"raw": result}, pick.rank, factor_weights={"value": 1})
 

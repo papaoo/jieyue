@@ -19,7 +19,6 @@ from unittest.mock import MagicMock, patch
 
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
-
 from src.services.runtime_scheduler import (
     CLI_SCHEDULER_OWNER_ENV,
     DEFAULT_RUNTIME_SCHEDULER_TIMEOUT_SECONDS,
@@ -31,6 +30,11 @@ from src.services.runtime_scheduler import (
     RuntimeSchedulerService,
     _run_scheduled_analysis_process,
 )
+
+
+def isolated_research_automation(app):
+    """Legacy scheduler tests must not initialize the independent live worker."""
+    return SimpleNamespace(service=SimpleNamespace(), start=lambda: None, stop=lambda: None)
 
 
 class _FakeJob:
@@ -745,11 +749,17 @@ class RuntimeSchedulerServiceTestCase(unittest.TestCase):
 
         scheduler = service._scheduler
         self.assertIsNotNone(scheduler)
-        self.assertEqual(len(scheduler.background_tasks), 1)  # type: ignore[attr-defined]
-        self.assertEqual(scheduler.background_tasks[0]["name"], "agent_event_monitor")  # type: ignore[index]
-        self.assertEqual(scheduler.background_tasks[0]["interval_seconds"], 7 * 60)  # type: ignore[index]
-        self.assertEqual(scheduler.background_tasks[0]["run_immediately"], True)  # type: ignore[index]
-        scheduler.background_tasks[0]["task"]()  # type: ignore[index]
+        # 后台任务：盘中事件监控 + 研判闭环事后评估（后者默认开启）
+        names = [task["name"] for task in scheduler.background_tasks]  # type: ignore[attr-defined]
+        self.assertEqual(names, ["agent_event_monitor", "outcome_evaluation"])
+        event_monitor = next(  # type: ignore[index]
+            task
+            for task in scheduler.background_tasks  # type: ignore[attr-defined]
+            if task["name"] == "agent_event_monitor"
+        )
+        self.assertEqual(event_monitor["interval_seconds"], 7 * 60)  # type: ignore[index]
+        self.assertEqual(event_monitor["run_immediately"], True)  # type: ignore[index]
+        event_monitor["task"]()  # type: ignore[index]
         fake_worker.run_once.assert_called_once()
 
     def test_rebuild_reuses_event_monitor_without_immediate_rerun(self) -> None:
@@ -913,8 +923,8 @@ class RuntimeSchedulerServiceTestCase(unittest.TestCase):
         ), patch("api.app.RuntimeSchedulerService", FakeRuntimeSchedulerService), patch(
             "api.app.SystemConfigService",
             FakeSystemConfigService,
-        ), patch("api.app._schedule_stock_index_background_refresh"):
-            app = create_app(static_dir=Path(temp_dir))
+        ), patch("api.app._schedule_stock_index_background_refresh"), patch("src.services.name_to_code_resolver.warmup_akshare_cache"):
+            app = create_app(static_dir=Path(temp_dir), research_automation_factory=isolated_research_automation)
             with TestClient(app):
                 pass
 
@@ -960,8 +970,8 @@ class RuntimeSchedulerServiceTestCase(unittest.TestCase):
         ), patch("api.app.RuntimeSchedulerService", FakeRuntimeSchedulerService), patch(
             "api.app.SystemConfigService",
             FakeSystemConfigService,
-        ), patch("api.app._schedule_stock_index_background_refresh"):
-            app = create_app(static_dir=Path(temp_dir))
+        ), patch("api.app._schedule_stock_index_background_refresh"), patch("src.services.name_to_code_resolver.warmup_akshare_cache"):
+            app = create_app(static_dir=Path(temp_dir), research_automation_factory=isolated_research_automation)
             with TestClient(app):
                 pass
 
@@ -1009,8 +1019,8 @@ class RuntimeSchedulerServiceTestCase(unittest.TestCase):
         ), patch("api.app.RuntimeSchedulerService", FakeRuntimeSchedulerService), patch(
             "api.app.SystemConfigService",
             FakeSystemConfigService,
-        ), patch("api.app._schedule_stock_index_background_refresh"):
-            app = create_app(static_dir=Path(temp_dir))
+        ), patch("api.app._schedule_stock_index_background_refresh"), patch("src.services.name_to_code_resolver.warmup_akshare_cache"):
+            app = create_app(static_dir=Path(temp_dir), research_automation_factory=isolated_research_automation)
             with TestClient(app):
                 pass
 
@@ -1065,8 +1075,8 @@ class RuntimeSchedulerServiceTestCase(unittest.TestCase):
         ), patch("api.app.RuntimeSchedulerService", FakeRuntimeSchedulerService), patch(
             "api.app.SystemConfigService",
             FakeSystemConfigService,
-        ), patch("api.app._schedule_stock_index_background_refresh"):
-            app = create_app(static_dir=Path(temp_dir))
+        ), patch("api.app._schedule_stock_index_background_refresh"), patch("src.services.name_to_code_resolver.warmup_akshare_cache"):
+            app = create_app(static_dir=Path(temp_dir), research_automation_factory=isolated_research_automation)
             with TestClient(app):
                 pass
 
@@ -1105,12 +1115,12 @@ class RuntimeSchedulerServiceTestCase(unittest.TestCase):
         ), patch("api.app.RuntimeSchedulerService", FakeRuntimeSchedulerService), patch(
             "api.app.SystemConfigService",
             FakeSystemConfigService,
-        ), patch("api.app._schedule_stock_index_background_refresh"):
+        ), patch("api.app._schedule_stock_index_background_refresh"), patch("src.services.name_to_code_resolver.warmup_akshare_cache"):
             os.environ.pop(CLI_SCHEDULER_OWNER_ENV, None)
             os.environ.pop(RUNTIME_SCHEDULER_FORCE_ENABLED_ENV, None)
             os.environ.pop(RUNTIME_SCHEDULER_RUN_IMMEDIATELY_ENV, None)
 
-            app = create_app(static_dir=Path(temp_dir))
+            app = create_app(static_dir=Path(temp_dir), research_automation_factory=isolated_research_automation)
             with TestClient(app):
                 pass
 

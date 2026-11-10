@@ -1,4 +1,6 @@
 import type React from 'react';
+import { ResearchDeliveryPanel } from '../components/settings/ResearchDeliveryPanel';
+import { FreeModelsPanel } from '../components/settings/FreeModelsPanel';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { CheckCircle2, ChevronDown, CircleAlert, CircleDashed, Clock, Play, Plus, RefreshCw, Trash2 } from 'lucide-react';
 import { useBlocker, useLocation } from 'react-router-dom';
@@ -704,8 +706,13 @@ const SettingsPage: React.FC = () => {
   const [setupSmokeError, setSetupSmokeError] = useState<ParsedApiError | null>(null);
   const [setupSmokeSuccess, setSetupSmokeSuccess] = useState('');
   const [localDraftResetToken, setLocalDraftResetToken] = useState(0);
+  const [researchDraftResetToken, setResearchDraftResetToken] = useState(0);
   const [llmChannelHasDirty, setLlmChannelHasDirty] = useState(false);
   const [llmChannelIsSaving, setLlmChannelIsSaving] = useState(false);
+  const [freeModelIsSaving, setFreeModelIsSaving] = useState(false);
+  const [researchDeliveryHasDirty, setResearchDeliveryHasDirty] = useState(false);
+  const [researchDeliveryIsSaving, setResearchDeliveryIsSaving] = useState(false);
+  const [notificationMode, setNotificationMode] = useState<'research' | 'legacy'>('research');
   const [llmChannelDraftItems, setLlmChannelDraftItems] = useState<SystemConfigUpdateItem[]>([]);
   const envBackupImportRef = useRef<HTMLInputElement | null>(null);
   const setupStatusRequestIdRef = useRef(0);
@@ -861,15 +868,17 @@ const SettingsPage: React.FC = () => {
   const hasRuntimeSchedulerMismatchInDraft = hasRuntimeSchedulerMismatch
     && !currentChangedItems.some((item) => item.key === 'SCHEDULE_ENABLED');
   const effectiveHasDirty = hasDirty || hasRuntimeSchedulerMismatchInDraft;
-  const hasUnsavedEdits = effectiveHasDirty || llmChannelHasDirty;
-  const hasPendingSave = isSaving || llmChannelIsSaving || isImportingEnv;
+  const hasUnsavedEdits = effectiveHasDirty || llmChannelHasDirty || researchDeliveryHasDirty;
+  const hasPendingSave = isSaving || llmChannelIsSaving || freeModelIsSaving || researchDeliveryIsSaving || isImportingEnv;
   const shouldGuardDeparture = hasUnsavedEdits || hasPendingSave;
   const clearAllDrafts = () => {
     resetDraft();
     setSchedulerOverrideFromUi(null);
     setLlmChannelDraftItems([]);
     setLlmChannelHasDirty(false);
+    setResearchDeliveryHasDirty(false);
     setLocalDraftResetToken((current) => current + 1);
+    setResearchDraftResetToken((current) => current + 1);
   };
   const resetAllDrafts = () => {
     if (!hasPendingSave) {
@@ -965,6 +974,7 @@ const SettingsPage: React.FC = () => {
       ? rawActiveItems.filter((item) => !BASE_HIDDEN_KEYS.has(item.key))
     : activeCategory === 'ai_model'
       ? rawActiveItems.filter((item) => {
+        if (item.key === 'FREE_MODEL_ENABLED' || item.key === 'FREE_MODEL_NAME') return false;
         if (hasConfiguredChannels && LLM_CHANNEL_KEY_RE.test(item.key)) {
           return false;
         }
@@ -1285,12 +1295,12 @@ const SettingsPage: React.FC = () => {
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            <Button
+            {activeCategory === 'notification' && notificationMode === 'research' ? <div className="text-sm text-muted-text">多群表单独立保存<Button variant="ghost" disabled={!researchDeliveryHasDirty || hasPendingSave} onClick={() => { setResearchDraftResetToken(v => v + 1); setResearchDeliveryHasDirty(false); }}>放弃未保存草稿</Button></div> : <><Button
               type="button"
               variant="settings-secondary"
               size="sm"
               className="px-2.5"
-              onClick={resetAllDrafts}
+              onClick={activeCategory === 'notification' ? resetDraft : resetAllDrafts}
               disabled={isLoading || hasPendingSave}
             >
               <RefreshCw className="h-4 w-4" aria-hidden="true" />
@@ -1312,7 +1322,7 @@ const SettingsPage: React.FC = () => {
                 : effectiveDirtyCount
                   ? t('settings.saveConfigWithCount', { count: effectiveDirtyCount })
                   : t('settings.saveConfig')}
-            </Button>
+            </Button></>}
           </div>
         </div>
 
@@ -1602,6 +1612,12 @@ const SettingsPage: React.FC = () => {
             ) : null}
             {activeCategory === 'ai_model' || llmChannelHasDirty || llmChannelIsSaving ? (
               <div hidden={activeCategory !== 'ai_model'}>
+              {activeCategory === 'ai_model' ? <div className="mb-4"><FreeModelsPanel
+                configVersion={configVersion}
+                disabled={isSaving || isLoading || isImportingEnv || hasUnsavedEdits}
+                onSavingChange={setFreeModelIsSaving}
+                onSaved={async keys => { await refreshAfterExternalSave(keys); void refreshSetupStatus(); }}
+              /></div> : null}
               <SettingsSectionCard
                 title={t('settings.llmAccess')}
                 description={t('settings.llmAccessDescription')}
@@ -1633,7 +1649,21 @@ const SettingsPage: React.FC = () => {
             {activeCategory === 'system' && passwordChangeable ? (
               <ChangePasswordCard />
             ) : null}
-            {activeCategory === 'notification' ? (
+            {activeCategory === 'notification' ? <section className="rd-notification-mode" aria-label="通知配置入口"><div className="rd-tabs"><button type="button" aria-pressed={notificationMode === 'research'} disabled={hasPendingSave} onClick={() => setNotificationMode('research')}>飞书多群订阅</button><button type="button" aria-pressed={notificationMode === 'legacy'} disabled={hasPendingSave} onClick={() => setNotificationMode('legacy')}>其他渠道与旧版通知</button></div><p className="rd-muted">{notificationMode === 'research' ? '每类一个群：使用下方“新增群订阅”，不需要填写旧版通知字段。' : '兼容原有单群通知、应用机器人和其他渠道；这里的“保存配置”和测试不作用于多群订阅。'}{effectiveHasDirty ? ' 通用设置还有未保存修改，切换入口不会丢失；请回对应入口保存。' : ''}</p></section> : null}
+            {(activeCategory === 'notification' && notificationMode === 'research') || researchDeliveryHasDirty || researchDeliveryIsSaving ? (
+              <div hidden={activeCategory !== 'notification' || notificationMode !== 'research'}>
+                <SettingsPanelErrorBoundary title="多群研究推送" resetKey={`research-delivery:${researchDraftResetToken}`} diagnosticHint={settingsPanelDiagnosticHint}>
+                  <ResearchDeliveryPanel
+                    visible={activeCategory === 'notification' && notificationMode === 'research'}
+                    draftResetToken={researchDraftResetToken}
+                    onDirtyChange={setResearchDeliveryHasDirty}
+                    onSavingChange={setResearchDeliveryIsSaving}
+                    disabled={isSaving || isLoading || isImportingEnv}
+                  />
+                </SettingsPanelErrorBoundary>
+              </div>
+            ) : null}
+            {activeCategory === 'notification' && notificationMode === 'legacy' ? (
               <SettingsPanelErrorBoundary
                 title={t('settings.notificationTest')}
                 resetKey={`notification-test:${configVersion}`}
@@ -1668,7 +1698,7 @@ const SettingsPage: React.FC = () => {
                 </SettingsSectionCard>
               </SettingsPanelErrorBoundary>
             ) : null}
-            {shouldGuardActiveConfigPanel && hasActiveConfigItems ? (
+            {activeCategory === 'notification' && notificationMode === 'research' ? null : shouldGuardActiveConfigPanel && hasActiveConfigItems ? (
               <SettingsPanelErrorBoundary
                 title={activeConfigPanelErrorTitle}
                 resetKey={`${activeCategory}:${configVersion}`}

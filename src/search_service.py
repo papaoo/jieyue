@@ -243,6 +243,8 @@ class SearchResult:
     relevance_category: Optional[str] = None
     relevance_reasons: Optional[List[str]] = None
     retrieved_at: Optional[str] = None  # 首次实际检索完成时间（UTC）；缓存读取不刷新
+    issuer_code: Optional[str] = None  # Only set by a structured announcement source.
+    evidence_kind: Optional[str] = None
     
     def to_text(self) -> str:
         """转换为文本格式"""
@@ -255,7 +257,8 @@ class SearchResult:
         if self.relevance_reasons:
             relevance_parts.append(f"依据: {'；'.join(self.relevance_reasons[:3])}")
         relevance_str = f"\n关联度: {'; '.join(relevance_parts)}" if relevance_parts else ""
-        return f"【{self.source}】{self.title}{date_str}\n{self.snippet}{relevance_str}"
+        evidence = f"\n证据类型: {self.evidence_kind}; 发行人: {self.issuer_code}" if self.evidence_kind else ""
+        return f"【{self.source}】{self.title}{date_str}\n{self.snippet}{relevance_str}{evidence}\n原文: {self.url}"
 
 
 @dataclass 
@@ -278,7 +281,7 @@ class SearchResponse:
     def to_context(self, max_results: int = 5) -> str:
         """将搜索结果转换为可用于 AI 分析的上下文"""
         if not self.success or not self.results:
-            return f"搜索 '{self.query}' 未找到相关结果。"
+            return f"搜索 '{self.query}' 未找到相关结果；未取得可核验证据，不代表没有公告、事件或风险。"
         
         lines = [f"【{self.query} 搜索结果】（来源：{self.provider}）"]
         for i, result in enumerate(self.results[:max_results], 1):
@@ -3027,6 +3030,20 @@ class SearchService:
         return source_label in cls._OFFICIAL_SOURCE_LABELS
 
     @classmethod
+    def _is_quote_landing_page(cls, item: SearchResult) -> bool:
+        """Reject quote dashboards, not news articles sharing a finance domain."""
+        parsed = urlparse(item.url or '')
+        host = (parsed.hostname or '').lower()
+        path = unquote(parsed.path).lower()
+        if (host == 'tradingview.com' or host.endswith('.tradingview.com')):
+            return bool(re.fullmatch(r'/symbols/[^/]+/(?:financials/|technicals/|forecast/)?', path + ('/' if not path.endswith('/') else '')))
+        if host == 'quote.eastmoney.com':
+            return bool(re.fullmatch(r'/(?:sh|sz|bj)?\d{6}\.html', path))
+        if host == 'finance.sina.com.cn':
+            return bool(re.fullmatch(r'/realstock/company/(?:sh|sz)\d{6}/nc\.shtml', path))
+        return False
+
+    @classmethod
     def _has_low_quality_news_page_signal(cls, item: SearchResult) -> bool:
         """Detect app/download/listing pages without relying on a domain blocklist."""
         content_text = " ".join(filter(None, [item.title, item.snippet])).lower()
@@ -3347,6 +3364,47 @@ class SearchService:
             else:
                 add_reason("未命中股票代码或公司全称，降级为背景新闻")
 
+        # A bank mentioned as a lender is not the issuer of another company's
+        # announcement. Only downgrade when the headline explicitly identifies
+        # another mainland ticker and never names the target itself.
+        headline_codes = set(re.findall(r'(?<!\d)([03689]\d{5})(?!\d)', title))
+        target_in_title = any(cls._contains_stock_code_identity_term(title, term)
+                              for term in cls._stock_code_identity_terms(stock_code)) or any(
+            cls._contains_identity_term(title, term) for term in cls._company_identity_terms(stock_name))
+        if headline_codes and not target_in_title and category == cls._DIRECT_NEWS_CATEGORY:
+            category = cls._SECTOR_NEWS_CATEGORY
+            score = min(score, 30)
+            reasons = ['标题主体为其他上市公司；目标仅在摘要出现，属于关联背景而非目标公司直接事件'] + reasons[:4]
+        if ('etf' in title.lower() and re.search(r'重仓股|成分股', title)
+                and not cls.is_index_or_etf(stock_code, stock_name)):
+            category = cls._SECTOR_NEWS_CATEGORY
+            score = min(score, 30)
+            reasons = ['ETF份额/持仓报道仅作关联背景，不等于成分股公司发生经营事件'] + reasons[:4]
+
+        if item.issuer_code:
+            if item.issuer_code in cls._stock_code_identity_terms(stock_code):
+                category, score = cls._DIRECT_NEWS_CATEGORY, max(score, 90)
+                reasons = ['结构化公告发行人代码匹配；仅元数据，正文内容仍需核验'] + reasons[:4]
+            else:
+                category, score = cls._SECTOR_NEWS_CATEGORY, 0
+                reasons = ['公告发行人不是目标公司'] + reasons[:4]
+        elif re.search(r'公告|信息披露', title):
+            # The leading subject, not a bank/customer named later in a title,
+            # is the putative issuer. Structured issuer evidence above wins.
+            subject = re.split(r'关于|[:：]', title, maxsplit=1)[0]
+            counterparty_names = [re.escape(term) for term in cls._company_identity_terms(stock_name) if term]
+            if counterparty_names:
+                # Split only before the actual target; do not split company names
+                # such as 和邦生物 merely because they contain a preposition.
+                subject = re.split(r'(?:向|与|和)\s*(?:' + '|'.join(counterparty_names) + ')',
+                                   subject, maxsplit=1)[0]
+            target_is_subject = any(cls._contains_stock_code_identity_term(subject, term)
+                                    for term in cls._stock_code_identity_terms(stock_code)) or any(
+                cls._contains_identity_term(subject, term) for term in cls._company_identity_terms(stock_name))
+            if not target_in_title or not target_is_subject:
+                category, score = cls._SECTOR_NEWS_CATEGORY, min(score, 20)
+                reasons = ['公告主体未核验，目标可能仅为交易对手或摘要提及，不等于目标公司事件'] + reasons[:4]
+
         score = max(0, min(100, score))
         return SearchResult(
             title=item.title,
@@ -3358,7 +3416,17 @@ class SearchService:
             relevance_category=category,
             relevance_reasons=reasons,
             retrieved_at=item.retrieved_at,
+            issuer_code=item.issuer_code,
+            evidence_kind=item.evidence_kind,
         )
+
+    @staticmethod
+    def _is_whole_newspaper_page(item: SearchResult) -> bool:
+        parsed = urlparse(item.url or "")
+        newspaper = any(part in parsed.netloc.lower() for part in ("epaper", "paper.cnstock", "zqrb.cn"))
+        generic_title = bool(re.fullmatch(r'[\s\d年月日\-/.A-Za-z]*信息披露[\s\dA-Za-z]*', item.title or ""))
+        page_pdf = bool(re.search(r'/(?:[a-z]{1,3}\d{1,3}|\d{1,3})\.pdf$', parsed.path, re.I))
+        return newspaper and (generic_title or page_pdf)
 
     @classmethod
     def _rank_news_response(
@@ -3393,7 +3461,24 @@ class SearchService:
             return (category_rank, language_rank, -score, index)
 
         ranked_results = [result for _, result in sorted(indexed_results, key=sort_key)]
-        limited_results = ranked_results[:max_results]
+        limited_results = []
+        seen = set()
+        for item in ranked_results:
+            parsed = urlparse(item.url or "")
+            url_key = (parsed.netloc.lower(), parsed.path, tuple(
+                (key, value) for key, value in parse_qsl(parsed.query)
+                if not key.lower().startswith("utm_") and key.lower() not in {"spm", "from"}
+            ))
+            event_key = (item.issuer_code, re.sub(r'\s+', '', item.title), item.published_date)
+            keys = [url_key] if item.url else []
+            if item.issuer_code and item.published_date:
+                keys.append(event_key)
+            if any(key in seen for key in keys):
+                continue
+            seen.update(keys)
+            limited_results.append(item)
+            if len(limited_results) >= max_results:
+                break
         category_counts = {
             cls._DIRECT_NEWS_CATEGORY: 0,
             cls._SECTOR_NEWS_CATEGORY: 0,
@@ -3441,6 +3526,12 @@ class SearchService:
         dropped_zero_relevance = 0
 
         for item in response.results:
+            if cls._is_whole_newspaper_page(item):
+                dropped_low_quality += 1
+                continue
+            if cls._is_quote_landing_page(item):
+                dropped_low_quality += 1
+                continue
             is_official_source = cls._is_trusted_official_news_source(item)
             if (
                 not is_official_source
@@ -3462,11 +3553,8 @@ class SearchService:
             if item.relevance_category == cls._DIRECT_NEWS_CATEGORY
             or (item.relevance_score or 0) > 0
         ]
-        if meaningful_candidates:
-            dropped_zero_relevance = len(candidates) - len(meaningful_candidates)
-            filtered_results = meaningful_candidates
-        else:
-            filtered_results = candidates
+        dropped_zero_relevance = len(candidates) - len(meaningful_candidates)
+        filtered_results = meaningful_candidates
 
         if dropped_low_quality or dropped_adult_spam or dropped_zero_relevance:
             logger.info(
@@ -3721,6 +3809,8 @@ class SearchService:
                             relevance_category=item.relevance_category,
                             relevance_reasons=item.relevance_reasons,
                             retrieved_at=item.retrieved_at,
+                            issuer_code=item.issuer_code,
+                            evidence_kind=item.evidence_kind,
                         )
                     )
                     if len(filtered) >= max_results:
@@ -3746,6 +3836,8 @@ class SearchService:
                     relevance_category=item.relevance_category,
                     relevance_reasons=item.relevance_reasons,
                     retrieved_at=item.retrieved_at,
+                    issuer_code=item.issuer_code,
+                    evidence_kind=item.evidence_kind,
                 )
             )
             if len(filtered) >= max_results:
@@ -3800,6 +3892,8 @@ class SearchService:
                     relevance_category=item.relevance_category,
                     relevance_reasons=item.relevance_reasons,
                     retrieved_at=item.retrieved_at,
+                    issuer_code=item.issuer_code,
+                    evidence_kind=item.evidence_kind,
                 )
             )
 
@@ -4163,9 +4257,11 @@ class SearchService:
                         success=False,
                         latency_ms=self._elapsed_ms(started_at),
                         error_type=type(exc).__name__,
-                        error_message=exc,
+                        error_message="provider request failed; trying next provider",
                     )
-                    raise
+                    logger.warning("%s stock news request failed (%s); trying next provider",
+                                   provider.name, type(exc).__name__)
+                    continue
                 filtered_response = self._filter_news_response(
                     response,
                     search_days=search_days,
@@ -4316,6 +4412,26 @@ class SearchService:
             if cache_owner and cache_event is not None:
                 self._release_cache_fill(cache_key, cache_event)
     
+    def search_company_announcements(self, stock_code: str, stock_name: str, max_results: int = 5) -> SearchResponse:
+        """Retrieve issuer-verified public metadata without requiring a search API key."""
+        from src.announcement_source import fetch_company_announcements
+        days = self._effective_news_window_days()
+        cache_key = self._cache_key(f"issuer_announcements:{stock_code}", max_results, days)
+        cached = self._get_cached(cache_key)
+        if cached is not None:
+            return cached
+        data = fetch_company_announcements(stock_code, days=days, limit=max_results)
+        response = SearchResponse(
+            query=f"{stock_name} 单公司公告", provider=data["source"] or "CompanyAnnouncements",
+            results=[SearchResult(**row, snippet="仅公告标题与发行人元数据，正文、金额、经营影响待核验。",
+                                  retrieved_at=data["fetched_at"]) for row in data["records"]],
+            success=data["ok"], error_message="；".join(data["warnings"]),
+        )
+        response = self._rank_news_response(response, stock_code=stock_code, stock_name=stock_name,
+                                            prefer_chinese=True, max_results=max_results, log_scope="announcements")
+        self._put_cache(cache_key, response)
+        return response
+
     def search_stock_events(
         self,
         stock_code: str,
@@ -4353,7 +4469,7 @@ class SearchService:
         cache_key = self._cache_key(
             f"stock_events:{query}|target={stock_code}:{stock_name}",
             5,
-            0,
+            self._effective_news_window_days(),
         )
         cached = self._get_cached(cache_key)
         if cached is not None:
@@ -4368,6 +4484,12 @@ class SearchService:
                 continue
             
             response = provider.search(query, max_results=5)
+            response = self._filter_news_response(response, search_days=self._effective_news_window_days(),
+                                                  max_results=5, log_scope="stock_events")
+            response = self._rank_news_response(response, stock_code=stock_code, stock_name=stock_name,
+                                                prefer_chinese=self._should_prefer_chinese_news(stock_code, stock_name),
+                                                max_results=5, log_scope="stock_events")
+            response = self._filter_ranked_news_for_context(response, log_scope="stock_events")
             
             if response.success:
                 self._put_cache(cache_key, response)
@@ -4546,6 +4668,13 @@ class SearchService:
         for dim in search_dimensions:
             if search_count >= max_searches:
                 break
+
+            if dim['name'] == 'announcements' and not is_index_etf:
+                announcements = self.search_company_announcements(stock_code, stock_name, target_per_dimension)
+                if announcements.success and announcements.results:
+                    results[dim['name']] = announcements
+                    search_count += 1
+                    continue
             
             # 选择搜索引擎（轮流使用）
             available_providers = [p for p in self._providers if p.is_available]
@@ -4670,6 +4799,8 @@ class SearchService:
             dim_desc = dim_labels.get(dim_name, dim_name)
             
             lines.append(f"\n{dim_desc} (来源: {resp.provider}):")
+            if dim_name == 'announcements' and resp.error_message:
+                lines.append(f"  覆盖说明：{resp.error_message}")
             if resp.success and resp.results:
                 # 增加显示条数
                 for i, r in enumerate(resp.results[:4], 1):
@@ -4678,6 +4809,9 @@ class SearchService:
                     # 如果摘要太短，可能信息量不足
                     snippet = r.snippet[:150] if len(r.snippet) > 20 else r.snippet
                     lines.append(f"     {snippet}...")
+                    lines.append(f"     原文: {r.url}")
+                    if r.evidence_kind:
+                        lines.append(f"     证据类型: {r.evidence_kind}; 发行人: {r.issuer_code}; 正文待核验")
                     if r.relevance_category or r.relevance_reasons:
                         relevance_parts = []
                         if r.relevance_category:
@@ -4688,7 +4822,7 @@ class SearchService:
                             relevance_parts.append(f"依据: {'；'.join(r.relevance_reasons[:3])}")
                         lines.append(f"     关联度: {'; '.join(relevance_parts)}")
             else:
-                lines.append("  未找到相关信息")
+                lines.append("  未找到相关信息；未取得可核验证据，不代表没有公告、事件或风险。")
         
         return "\n".join(lines)
     

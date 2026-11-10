@@ -3,8 +3,8 @@
 # 超跌反转策略
 name: oversold_reversal
 display_name: 超跌反转
-description: 跌幅可控、流动性仍在、具备修复观察价值的反转候选
-version: "1.1"
+description: 基于跌幅、估值与成交活跃度的修复观察池，不代表已确认超卖或反转
+version: "2.1"
 category: reversal
 tags: [reversal, oversold, repair]
 analysis_skills: [bottom_volume]
@@ -17,6 +17,7 @@ style:
   ui_badge: 反转
 
 screening:
+  evidence_mode: daily_required
   enabled: true
   market_scope: [cn]
   hard_filters:

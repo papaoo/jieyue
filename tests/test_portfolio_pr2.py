@@ -488,6 +488,10 @@ class PortfolioPr2TestCase(unittest.TestCase):
         self.assertAlmostEqual(positions["AAPL"]["market_value_base"], 700.0, places=6)
 
     def test_sector_concentration_uses_unclassified_for_non_cn(self) -> None:
+        self.service.repo.save_fx_rate(
+            from_currency="USD", to_currency="CNY", rate_date=date(2026, 1, 1),
+            rate=7.0, source="offline_test", is_stale=False,
+        )
         us_account = self.service.create_account(name="US", broker="Demo", market="us", base_currency="USD")
         us_id = us_account["id"]
         self.service.record_cash_ledger(

@@ -339,6 +339,10 @@ class GenerationBackendStatusService:
         }
 
     def _primary_backend_id(self) -> str:
+        from src.llm.free_models import enabled
+        config = self._build_backend_config()
+        if enabled(config):
+            return LITELLM_BACKEND_ID
         return normalize_backend_id(self._effective_map.get("GENERATION_BACKEND"), default=LITELLM_BACKEND_ID)
 
     def _normalize_smoke_request(
@@ -532,6 +536,10 @@ class GenerationBackendStatusService:
         )
 
     def _litellm_route_error(self, config: Any) -> Optional[GenerationError]:
+        from src.llm.free_models import enabled
+        if enabled(config):
+            # Saved regular-model fallbacks are inactive, not free-channel routes.
+            return None
         model = str(getattr(config, "litellm_model", "") or "").strip()
         model_list = getattr(config, "llm_model_list", []) or []
         route_models = set(get_configured_llm_models(model_list))
@@ -676,6 +684,7 @@ class GenerationBackendStatusService:
         )
 
     def _build_backend_config(self) -> SimpleNamespace:
+        from src.llm.free_models import apply_runtime_route, settings_from_map
         model_list = self._build_litellm_model_list(self._effective_map)
         route_models = get_configured_llm_models(model_list)
         litellm_model = (self._effective_map.get("LITELLM_MODEL") or "").strip()
@@ -688,7 +697,7 @@ class GenerationBackendStatusService:
             litellm_model = route_models[0]
         if not litellm_model and uses_legacy_router:
             litellm_model = self._infer_legacy_litellm_model(self._effective_map)
-        return SimpleNamespace(
+        config = SimpleNamespace(
             generation_backend=normalize_backend_id(
                 self._effective_map.get("GENERATION_BACKEND"),
                 default=LITELLM_BACKEND_ID,
@@ -713,7 +722,10 @@ class GenerationBackendStatusService:
             opencode_cli_model=(self._effective_map.get("OPENCODE_CLI_MODEL") or "").strip(),
             litellm_model=litellm_model,
             llm_model_list=model_list,
+            **settings_from_map(self._effective_map),
         )
+        apply_runtime_route(config)
+        return config
 
     def _fallback_from_map(self) -> str:
         if "GENERATION_FALLBACK_BACKEND" not in self._effective_map:
@@ -726,10 +738,13 @@ class GenerationBackendStatusService:
         backend_id: Optional[str] = None,
         timeout_seconds: Optional[int] = None,
     ) -> Config:
+        from src.llm.free_models import settings_from_map
         config = self._build_backend_config()
         primary = backend_id or config.generation_backend
         openai_keys = self._openai_keys_from_map(self._effective_map)
         return Config(
+            **settings_from_map(self._effective_map),
+            database_path=self._effective_map.get("DATABASE_PATH") or "./data/stock_analysis.db",
             generation_backend=primary,
             generation_fallback_backend="",
             generation_backend_timeout_seconds=timeout_seconds or config.generation_backend_timeout_seconds,
